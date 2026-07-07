@@ -511,10 +511,6 @@ if page == "💵 Quick Sale":
         # 🎯 Compact goal tracker at top
         render_goal_progress(st.session_state.current_event, compact=True)
         st.markdown("---")
-if page == "💵 Quick Sale":
-    st.title("💵 Quick Sale")
-    if st.session_state.current_event:
-        st.caption(f"📍 Current event: **{st.session_state.current_event}**")
 
     all_items = [i for i in get_inventory() if int(i.get("stock", 0) or 0) > 0]
 
