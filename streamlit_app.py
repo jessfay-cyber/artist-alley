@@ -150,100 +150,142 @@ def get_goals():
         return goals_ws.get_all_records()
     except Exception:
         return []
-
 def get_goal_for_event(event_name):
-    """Returns dict with revenue_goal, table_cost for the given event."""
+    """Returns dict with all goal + cost fields for the given event."""
     goals = get_goals()
-    default = {"revenue_goal": 0, "table_cost": 0, "notes": ""}
+    default = {
+        "revenue_goal": 0, "table_cost": 0,
+        "hotel_cost": 0, "travel_cost": 0, "other_costs": 0,
+        "notes": ""
+    }
+
+    def parse_row(g):
+        return {
+            "revenue_goal": float(g.get("revenue_goal", 0) or 0),
+            "table_cost": float(g.get("table_cost", 0) or 0),
+            "hotel_cost": float(g.get("hotel_cost", 0) or 0),
+            "travel_cost": float(g.get("travel_cost", 0) or 0),
+            "other_costs": float(g.get("other_costs", 0) or 0),
+            "notes": str(g.get("notes", "") or ""),
+        }
+
     for g in goals:
         if str(g.get("event", "")).strip().lower() == str(event_name).strip().lower():
-            return {
-                "revenue_goal": float(g.get("revenue_goal", 0) or 0),
-                "table_cost": float(g.get("table_cost", 0) or 0),
-                "notes": str(g.get("notes", "") or ""),
-            }
-    # Fall back to _default_ row
+            return parse_row(g)
     for g in goals:
         if str(g.get("event", "")).strip().lower() == "_default_":
-            return {
-                "revenue_goal": float(g.get("revenue_goal", 0) or 0),
-                "table_cost": float(g.get("table_cost", 0) or 0),
-                "notes": str(g.get("notes", "") or ""),
-            }
+            return parse_row(g)
     return default
 
-def event_revenue(event_name, df_sales=None):
-    """Total revenue for a specific event so far."""
-    if df_sales is None:
-        sales = get_sales()
-        if not sales: return 0
-        df_sales = pd.DataFrame(sales)
-        df_sales["total"] = pd.to_numeric(df_sales["total"], errors="coerce").fillna(0)
-    return df_sales[df_sales["event"] == event_name]["total"].sum()
-
 def render_goal_progress(event_name, compact=False):
-    """Renders the goal progress bar + milestones. Reusable across pages."""
+    """Renders the goal progress bar + milestones with full cost breakdown."""
     goal = get_goal_for_event(event_name)
-    if goal["revenue_goal"] <= 0:
-        return  # No goal set
+    if goal["revenue_goal"] <= 0 and goal["table_cost"] == 0:
+        return
 
     current = event_revenue(event_name)
+
+    # Calculate totals
+    total_costs = (goal["table_cost"] + goal["hotel_cost"]
+                   + goal["travel_cost"] + goal["other_costs"])
+    net_profit = current - total_costs
+
+    # Progress calculation
     pct = min(current / goal["revenue_goal"], 1.0) if goal["revenue_goal"] else 0
     remaining = max(0, goal["revenue_goal"] - current)
 
     # Milestone status
     hit_table = goal["table_cost"] > 0 and current >= goal["table_cost"]
+    hit_breakeven = total_costs > 0 and current >= total_costs
     hit_half = current >= goal["revenue_goal"] * 0.5
     hit_goal = current >= goal["revenue_goal"]
     hit_stretch = current >= goal["revenue_goal"] * 1.25
 
     # Header
     if compact:
-        st.markdown(f"**🎯 {event_name} Goal:** "
+        profit_display = (f"💵 +${net_profit:.0f}" if net_profit >= 0
+                          else f"⚠️ -${abs(net_profit):.0f}")
+        st.markdown(f"**🎯 {event_name}:** "
                     f"${current:.0f} / ${goal['revenue_goal']:.0f}  "
-                    f"({pct*100:.0f}%)")
+                    f"({pct*100:.0f}%)  •  {profit_display}")
     else:
         st.subheader(f"🎯 Goal Progress — {event_name}")
 
-    # Progress bar
     st.progress(pct)
 
-    # Metrics row
+    # Metrics row 1: revenue focus
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Earned so far", f"${current:.2f}")
-    m2.metric("Goal", f"${goal['revenue_goal']:.2f}")
+    m2.metric("Revenue goal", f"${goal['revenue_goal']:.2f}")
     m3.metric("Remaining", f"${remaining:.2f}" if not hit_goal else "✅ Hit!")
     m4.metric("% of goal", f"{pct*100:.0f}%")
 
-    # Milestone badges
-    milestones = []
-    if goal["table_cost"] > 0:
-        icon = "✅" if hit_table else "⬜"
-        milestones.append(f"{icon} Table paid off (${goal['table_cost']:.0f})")
-    milestones.append(f"{'✅' if hit_half else '⬜'} Halfway there "
-                      f"(${goal['revenue_goal']*0.5:.0f})")
-    milestones.append(f"{'🎉' if hit_goal else '⬜'} Goal reached "
-                      f"(${goal['revenue_goal']:.0f})")
-    milestones.append(f"{'🚀' if hit_stretch else '⬜'} Stretch goal 125% "
-                      f"(${goal['revenue_goal']*1.25:.0f})")
+    # Metrics row 2: profit focus (only in detailed view)
+    if not compact and total_costs > 0:
+        st.markdown("### 💰 Profit Picture")
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Total costs", f"${total_costs:.2f}")
+        p2.metric("Break-even at", f"${total_costs:.2f}")
+        p3.metric("Net profit",
+                  f"${net_profit:.2f}",
+                  delta=f"${net_profit:.2f}",
+                  delta_color="normal" if net_profit >= 0 else "inverse")
+        margin = (net_profit / current * 100) if current > 0 else 0
+        p4.metric("Profit margin", f"{margin:.0f}%")
 
+        # Cost breakdown
+        with st.expander("📋 Cost breakdown"):
+            cost_items = []
+            if goal["table_cost"] > 0:
+                cost_items.append(("🎪 Table fee", goal["table_cost"]))
+            if goal["hotel_cost"] > 0:
+                cost_items.append(("🏨 Hotel", goal["hotel_cost"]))
+            if goal["travel_cost"] > 0:
+                cost_items.append(("✈️ Travel", goal["travel_cost"]))
+            if goal["other_costs"] > 0:
+                cost_items.append(("🍜 Other (food/supplies)", goal["other_costs"]))
+            for label, amt in cost_items:
+                st.write(f"{label}: **${amt:.2f}**")
+            st.write(f"---")
+            st.write(f"**Total costs: ${total_costs:.2f}**")
+
+    # Milestones
     if not compact:
-        st.markdown("**Milestones:**")
-        for m in milestones:
-            st.markdown(f"- {m}")
+        st.markdown("### 🏆 Milestones")
+        milestones = []
+        if goal["table_cost"] > 0:
+            milestones.append((hit_table, f"Table paid off (${goal['table_cost']:.0f})"))
+        if total_costs > 0 and total_costs != goal["table_cost"]:
+            milestones.append((hit_breakeven, f"💰 BREAK EVEN (${total_costs:.0f})"))
+        milestones.append((hit_half,
+            f"Halfway to goal (${goal['revenue_goal']*0.5:.0f})"))
+        milestones.append((hit_goal,
+            f"🎉 Goal reached (${goal['revenue_goal']:.0f})"))
+        milestones.append((hit_stretch,
+            f"🚀 Stretch 125% (${goal['revenue_goal']*1.25:.0f})"))
 
-    # Celebration banners for freshly-hit milestones
+        for hit, label in milestones:
+            icon = "✅" if hit else "⬜"
+            st.markdown(f"- {icon} {label}")
+
+    # Celebrations
     if hit_stretch:
-        st.balloons() if st.session_state.get("celebrated_stretch") != event_name else None
-        st.session_state["celebrated_stretch"] = event_name
+        if st.session_state.get("celebrated_stretch") != event_name:
+            st.balloons()
+            st.session_state["celebrated_stretch"] = event_name
         st.success(f"🚀 CRUSHING IT — you're at 125%+ of your goal!")
     elif hit_goal:
         if st.session_state.get("celebrated_goal") != event_name:
             st.balloons()
             st.session_state["celebrated_goal"] = event_name
-        st.success(f"🎉 Goal reached at {event_name}! Everything from here is bonus.")
+        st.success(f"🎉 Goal reached! Everything from here is bonus.")
+    elif hit_breakeven and total_costs > 0:
+        if st.session_state.get("celebrated_breakeven") != event_name:
+            st.balloons()
+            st.session_state["celebrated_breakeven"] = event_name
+        st.success(f"💰 BROKE EVEN! Every sale from here is pure profit. 🎉")
     elif hit_table and goal["table_cost"] > 0:
-        st.info(f"💰 Table cost covered — you're officially profitable today!")
+        st.info(f"✅ Table cost covered — now working toward covering the trip!")
 
     if goal["notes"]:
         st.caption(f"📝 {goal['notes']}")
@@ -943,14 +985,26 @@ elif page == "🎯 Goals":
                     rate = current / hours_worked
                     projected = current + (rate * hours_remaining)
                     projected_pct = (projected / goal["revenue_goal"]) * 100
+                    projected_profit = projected - total_costs
 
-                    pcm1, pcm2, pcm3 = st.columns(3)
+                    pcm1, pcm2, pcm3, pcm4 = st.columns(4)
                     pcm1.metric("Rate", f"${rate:.2f}/hr")
-                    pcm2.metric("Projected total", f"${projected:.2f}")
-                    pcm3.metric("Projected % of goal",
+                    pcm2.metric("Projected revenue", f"${projected:.2f}")
+                    pcm3.metric("Projected profit",
+                                f"${projected_profit:.2f}",
+                                delta_color="normal" if projected_profit >= 0
+                                            else "inverse")
+                    pcm4.metric("Projected % of goal",
                                 f"{projected_pct:.0f}%")
 
+                    # Contextual advice
                     remaining_needed = goal["revenue_goal"] - current
+                    breakeven_needed = total_costs - current
+                    if breakeven_needed > 0 and hours_remaining > 0:
+                        breakeven_rate = breakeven_needed / hours_remaining
+                        st.warning(
+                            f"⚠️ Still ${breakeven_needed:.0f} away from breaking "
+                            f"even. Need ${breakeven_rate:.2f}/hr just to cover costs.")
                     if remaining_needed > 0 and hours_remaining > 0:
                         needed_rate = remaining_needed / hours_remaining
                         if needed_rate > rate:
@@ -962,7 +1016,6 @@ elif page == "🎯 Goals":
                             st.success(
                                 f"✅ On track! Just need ${needed_rate:.2f}/hr "
                                 f"the rest of the way.")
-
     with tab2:
         goals = get_goals()
         if not goals:
@@ -990,44 +1043,62 @@ elif page == "🎯 Goals":
                 if event == "_default_" or not event: continue
                 gval = float(g.get("revenue_goal", 0) or 0)
                 if gval <= 0: continue
+
+                table = float(g.get("table_cost", 0) or 0)
+                hotel = float(g.get("hotel_cost", 0) or 0)
+                travel = float(g.get("travel_cost", 0) or 0)
+                other = float(g.get("other_costs", 0) or 0)
+                total_cost = table + hotel + travel + other
+
                 actual = df_sales[df_sales["event"] == event]["total"].sum()
                 pct = (actual / gval * 100) if gval else 0
+                profit = actual - total_cost
+                margin = (profit / actual * 100) if actual > 0 else 0
+
                 history.append({
                     "Event": event,
+                    "Revenue": actual,
                     "Goal": gval,
-                    "Actual": actual,
+                    "Total Cost": total_cost,
+                    "Net Profit": profit,
+                    "Margin": margin,
                     "% of Goal": pct,
                     "Result": "🎉 Hit" if pct >= 100 else
                               ("👍 Close" if pct >= 80 else "📉 Missed"),
-                    "Diff": actual - gval,
+                    "Profitable": "✅" if profit > 0 else "❌",
                 })
 
             if not history:
                 st.info("No completed events with revenue yet.")
             else:
                 df_hist = pd.DataFrame(history).sort_values(
-                    "% of Goal", ascending=False)
+                    "Net Profit", ascending=False)
 
                 hit_count = sum(1 for h in history if h["% of Goal"] >= 100)
+                profitable_count = sum(1 for h in history if h["Net Profit"] > 0)
                 total = len(history)
-                avg_pct = sum(h["% of Goal"] for h in history) / total
+                total_profit = sum(h["Net Profit"] for h in history)
 
-                mh1, mh2, mh3 = st.columns(3)
-                mh1.metric("Events with goals", total)
+                mh1, mh2, mh3, mh4 = st.columns(4)
+                mh1.metric("Events", total)
                 mh2.metric("Goals hit",
                           f"{hit_count} ({hit_count/total*100:.0f}%)")
-                mh3.metric("Avg % of goal", f"{avg_pct:.0f}%")
+                mh3.metric("Profitable",
+                          f"{profitable_count} ({profitable_count/total*100:.0f}%)")
+                mh4.metric("Total profit", f"${total_profit:.2f}")
 
                 display = df_hist.copy()
+                display["Revenue"] = display["Revenue"].map("${:.0f}".format)
                 display["Goal"] = display["Goal"].map("${:.0f}".format)
-                display["Actual"] = display["Actual"].map("${:.0f}".format)
-                display["% of Goal"] = display["% of Goal"].map(
-                    "{:.0f}%".format)
-                display["Diff"] = display["Diff"].map("${:+.0f}".format)
-                st.dataframe(display, use_container_width=True,
-                            hide_index=True)
+                display["Total Cost"] = display["Total Cost"].map("${:.0f}".format)
+                display["Net Profit"] = display["Net Profit"].map("${:+.0f}".format)
+                display["Margin"] = display["Margin"].map("{:.0f}%".format)
+                display["% of Goal"] = display["% of Goal"].map("{:.0f}%".format)
+                st.dataframe(display, use_container_width=True, hide_index=True)
 
-                st.bar_chart(df_hist.set_index("Event")["% of Goal"])
+                # Profit-focused chart
+                st.subheader("💰 Net Profit by Convention")
+                st.bar_chart(df_hist.set_index("Event")["Net Profit"])
 # ================================================================
 # 📜 SALES HISTORY
 # ================================================================
