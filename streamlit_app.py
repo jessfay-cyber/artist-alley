@@ -945,7 +945,7 @@ if not df_items.empty:
         df_items[col] = pd.to_numeric(df_items[col], errors="coerce").fillna(0)
     profit = ((df_items["unit_price"] - df_items["unit_cost"]) * df_items["qty"]).sum()
 
-        m1, m2, m3, m4 = st.columns(4)
+     m1, m2, m3, m4 = st.columns(4)
         m1.metric("Today", f"${rev_t:.2f}")
         m2.metric("7 days", f"${rev_w:.2f}")
         m3.metric("All-time", f"${rev_a:.2f}")
