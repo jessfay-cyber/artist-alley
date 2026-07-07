@@ -140,6 +140,113 @@ def get_deals():
     if not deals_ws: return []
     return [d for d in deals_ws.get_all_records()
             if str(d.get("active", "")).upper() == "TRUE"]
+            # ================================================================
+# 🎯 GOALS TRACKING
+# ================================================================
+@st.cache_data(ttl=30)
+def get_goals():
+    try:
+        goals_ws = sh.worksheet("Goals")
+        return goals_ws.get_all_records()
+    except Exception:
+        return []
+
+def get_goal_for_event(event_name):
+    """Returns dict with revenue_goal, table_cost for the given event."""
+    goals = get_goals()
+    default = {"revenue_goal": 0, "table_cost": 0, "notes": ""}
+    for g in goals:
+        if str(g.get("event", "")).strip().lower() == str(event_name).strip().lower():
+            return {
+                "revenue_goal": float(g.get("revenue_goal", 0) or 0),
+                "table_cost": float(g.get("table_cost", 0) or 0),
+                "notes": str(g.get("notes", "") or ""),
+            }
+    # Fall back to _default_ row
+    for g in goals:
+        if str(g.get("event", "")).strip().lower() == "_default_":
+            return {
+                "revenue_goal": float(g.get("revenue_goal", 0) or 0),
+                "table_cost": float(g.get("table_cost", 0) or 0),
+                "notes": str(g.get("notes", "") or ""),
+            }
+    return default
+
+def event_revenue(event_name, df_sales=None):
+    """Total revenue for a specific event so far."""
+    if df_sales is None:
+        sales = get_sales()
+        if not sales: return 0
+        df_sales = pd.DataFrame(sales)
+        df_sales["total"] = pd.to_numeric(df_sales["total"], errors="coerce").fillna(0)
+    return df_sales[df_sales["event"] == event_name]["total"].sum()
+
+def render_goal_progress(event_name, compact=False):
+    """Renders the goal progress bar + milestones. Reusable across pages."""
+    goal = get_goal_for_event(event_name)
+    if goal["revenue_goal"] <= 0:
+        return  # No goal set
+
+    current = event_revenue(event_name)
+    pct = min(current / goal["revenue_goal"], 1.0) if goal["revenue_goal"] else 0
+    remaining = max(0, goal["revenue_goal"] - current)
+
+    # Milestone status
+    hit_table = goal["table_cost"] > 0 and current >= goal["table_cost"]
+    hit_half = current >= goal["revenue_goal"] * 0.5
+    hit_goal = current >= goal["revenue_goal"]
+    hit_stretch = current >= goal["revenue_goal"] * 1.25
+
+    # Header
+    if compact:
+        st.markdown(f"**🎯 {event_name} Goal:** "
+                    f"${current:.0f} / ${goal['revenue_goal']:.0f}  "
+                    f"({pct*100:.0f}%)")
+    else:
+        st.subheader(f"🎯 Goal Progress — {event_name}")
+
+    # Progress bar
+    st.progress(pct)
+
+    # Metrics row
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Earned so far", f"${current:.2f}")
+    m2.metric("Goal", f"${goal['revenue_goal']:.2f}")
+    m3.metric("Remaining", f"${remaining:.2f}" if not hit_goal else "✅ Hit!")
+    m4.metric("% of goal", f"{pct*100:.0f}%")
+
+    # Milestone badges
+    milestones = []
+    if goal["table_cost"] > 0:
+        icon = "✅" if hit_table else "⬜"
+        milestones.append(f"{icon} Table paid off (${goal['table_cost']:.0f})")
+    milestones.append(f"{'✅' if hit_half else '⬜'} Halfway there "
+                      f"(${goal['revenue_goal']*0.5:.0f})")
+    milestones.append(f"{'🎉' if hit_goal else '⬜'} Goal reached "
+                      f"(${goal['revenue_goal']:.0f})")
+    milestones.append(f"{'🚀' if hit_stretch else '⬜'} Stretch goal 125% "
+                      f"(${goal['revenue_goal']*1.25:.0f})")
+
+    if not compact:
+        st.markdown("**Milestones:**")
+        for m in milestones:
+            st.markdown(f"- {m}")
+
+    # Celebration banners for freshly-hit milestones
+    if hit_stretch:
+        st.balloons() if st.session_state.get("celebrated_stretch") != event_name else None
+        st.session_state["celebrated_stretch"] = event_name
+        st.success(f"🚀 CRUSHING IT — you're at 125%+ of your goal!")
+    elif hit_goal:
+        if st.session_state.get("celebrated_goal") != event_name:
+            st.balloons()
+            st.session_state["celebrated_goal"] = event_name
+        st.success(f"🎉 Goal reached at {event_name}! Everything from here is bonus.")
+    elif hit_table and goal["table_cost"] > 0:
+        st.info(f"💰 Table cost covered — you're officially profitable today!")
+
+    if goal["notes"]:
+        st.caption(f"📝 {goal['notes']}")
 
 # ================================================================
 # 🔧 UTILITIES
@@ -369,6 +476,7 @@ page = st.sidebar.radio("Go to", [
     "💵 Quick Sale",
     "📦 Inventory",
     "🎁 Combo Deals",
+     "🎯 Goals",
     "📜 Sales History",
     "📊 Dashboard"
 ])
@@ -396,6 +504,13 @@ if st.sidebar.button("🚪 Log out"):
 # ================================================================
 # 💵 QUICK SALE
 # ================================================================
+if page == "💵 Quick Sale":
+    st.title("💵 Quick Sale")
+    if st.session_state.current_event:
+        st.caption(f"📍 Current event: **{st.session_state.current_event}**")
+        # 🎯 Compact goal tracker at top
+        render_goal_progress(st.session_state.current_event, compact=True)
+        st.markdown("---")
 if page == "💵 Quick Sale":
     st.title("💵 Quick Sale")
     if st.session_state.current_event:
@@ -798,7 +913,125 @@ elif page == "🎁 Combo Deals":
         else:
             st.info("Add a 'Combo Sales Log' tab to your Google Sheet "
                     "to enable performance tracking.")
+# ================================================================
+# 🎯 GOALS
+# ================================================================
+elif page == "🎯 Goals":
+    st.title("🎯 Sales Goals")
 
+    tab1, tab2, tab3 = st.tabs(
+        ["Current Event", "All Goals", "📈 Goal History"])
+
+    with tab1:
+        if not st.session_state.current_event:
+            st.info("👈 Set a Current Event in the sidebar to track live goal progress.")
+        else:
+            render_goal_progress(st.session_state.current_event, compact=False)
+
+            # Pace calculator
+            goal = get_goal_for_event(st.session_state.current_event)
+            if goal["revenue_goal"] > 0:
+                current = event_revenue(st.session_state.current_event)
+                st.markdown("---")
+                st.subheader("⏱ Pace Calculator")
+
+                pc1, pc2 = st.columns(2)
+                hours_worked = pc1.number_input(
+                    "Hours worked so far today",
+                    min_value=0.5, value=4.0, step=0.5)
+                hours_remaining = pc2.number_input(
+                    "Hours remaining in event",
+                    min_value=0.0, value=6.0, step=0.5)
+
+                if hours_worked > 0:
+                    rate = current / hours_worked
+                    projected = current + (rate * hours_remaining)
+                    projected_pct = (projected / goal["revenue_goal"]) * 100
+
+                    pcm1, pcm2, pcm3 = st.columns(3)
+                    pcm1.metric("Rate", f"${rate:.2f}/hr")
+                    pcm2.metric("Projected total", f"${projected:.2f}")
+                    pcm3.metric("Projected % of goal",
+                                f"{projected_pct:.0f}%")
+
+                    remaining_needed = goal["revenue_goal"] - current
+                    if remaining_needed > 0 and hours_remaining > 0:
+                        needed_rate = remaining_needed / hours_remaining
+                        if needed_rate > rate:
+                            st.warning(
+                                f"💪 Need to pick up the pace: "
+                                f"${needed_rate:.2f}/hr to hit goal "
+                                f"(currently ${rate:.2f}/hr)")
+                        else:
+                            st.success(
+                                f"✅ On track! Just need ${needed_rate:.2f}/hr "
+                                f"the rest of the way.")
+
+    with tab2:
+        goals = get_goals()
+        if not goals:
+            st.info("Add goals to your 'Goals' tab in the Google Sheet.")
+        else:
+            df_goals = pd.DataFrame(goals)
+            st.dataframe(df_goals, use_container_width=True, hide_index=True)
+            st.caption("💡 Edit goals directly in the Google Sheet — "
+                       "changes appear within 30 sec.")
+
+    with tab3:
+        goals = get_goals()
+        sales = get_sales()
+        if not goals or not sales:
+            st.info("Need goals + at least one completed event to see history.")
+        else:
+            df_sales = pd.DataFrame(sales)
+            df_sales["total"] = pd.to_numeric(
+                df_sales["total"], errors="coerce").fillna(0)
+            df_sales["event"] = df_sales["event"].fillna("").astype(str)
+
+            history = []
+            for g in goals:
+                event = str(g.get("event", "")).strip()
+                if event == "_default_" or not event: continue
+                gval = float(g.get("revenue_goal", 0) or 0)
+                if gval <= 0: continue
+                actual = df_sales[df_sales["event"] == event]["total"].sum()
+                pct = (actual / gval * 100) if gval else 0
+                history.append({
+                    "Event": event,
+                    "Goal": gval,
+                    "Actual": actual,
+                    "% of Goal": pct,
+                    "Result": "🎉 Hit" if pct >= 100 else
+                              ("👍 Close" if pct >= 80 else "📉 Missed"),
+                    "Diff": actual - gval,
+                })
+
+            if not history:
+                st.info("No completed events with revenue yet.")
+            else:
+                df_hist = pd.DataFrame(history).sort_values(
+                    "% of Goal", ascending=False)
+
+                hit_count = sum(1 for h in history if h["% of Goal"] >= 100)
+                total = len(history)
+                avg_pct = sum(h["% of Goal"] for h in history) / total
+
+                mh1, mh2, mh3 = st.columns(3)
+                mh1.metric("Events with goals", total)
+                mh2.metric("Goals hit",
+                          f"{hit_count} ({hit_count/total*100:.0f}%)")
+                mh3.metric("Avg % of goal", f"{avg_pct:.0f}%")
+
+                display = df_hist.copy()
+                display["Goal"] = display["Goal"].map("${:.0f}".format)
+                display["Actual"] = display["Actual"].map("${:.0f}".format)
+                display["% of Goal"] = display["% of Goal"].map(
+                    "{:.0f}%".format)
+                display["Diff"] = display["Diff"].map("${:+.0f}".format)
+                st.dataframe(display, use_container_width=True,
+                            hide_index=True)
+
+                st.bar_chart(df_hist.set_index("Event")["% of Goal"])
 # ================================================================
 # 📜 SALES HISTORY
 # ================================================================
@@ -825,6 +1058,12 @@ elif page == "📜 Sales History":
 # ================================================================
 elif page == "📊 Dashboard":
     st.title("📊 Dashboard")
+    # 🎯 Current event goal snapshot
+    if st.session_state.current_event:
+        goal = get_goal_for_event(st.session_state.current_event)
+        if goal["revenue_goal"] > 0:
+            render_goal_progress(st.session_state.current_event, compact=True)
+            st.markdown("---")
     sales = get_sales()
     sale_items = get_sale_items()
 
