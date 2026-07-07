@@ -303,7 +303,56 @@ def calculate_combos(cart, inventory, deals):
                     })
 
     return raw_total - total_discount, applied, []
+# ================================================================
+# 🎨 SERIES COLOR MAPPING
+# ================================================================
+# Curated fallback palette (con-friendly, high contrast)
+FALLBACK_PALETTE = [
+    "#14b8a6",  # teal
+    "#eab308",  # amber
+    "#8b5cf6",  # purple
+    "#ec4899",  # pink
+    "#0ea5e9",  # sky
+    "#22c55e",  # green
+    "#f97316",  # orange
+    "#ef4444",  # red
+    "#a855f7",  # violet
+    "#06b6d4",  # cyan
+    "#84cc16",  # lime
+    "#f43f5e",  # rose
+]
 
+@st.cache_data(ttl=60)
+def get_series_colors():
+    """Load custom colors from optional Series Colors tab."""
+    try:
+        colors_ws = sh.worksheet("Series Colors")
+        records = colors_ws.get_all_records()
+        return {str(r["series"]).strip(): str(r["color"]).strip()
+                for r in records
+                if r.get("series") and r.get("color")}
+    except Exception:
+        return {}
+
+def color_for_series(series_name, custom_colors, auto_map):
+    """Return a hex color for a series — custom first, else auto."""
+    if series_name in custom_colors:
+        return custom_colors[series_name]
+    if series_name not in auto_map:
+        # Stable hash-based assignment so a series always gets the same color
+        idx = abs(hash(series_name)) % len(FALLBACK_PALETTE)
+        auto_map[series_name] = FALLBACK_PALETTE[idx]
+    return auto_map[series_name]
+
+def contrast_text(hex_color):
+    """Pick black or white text based on background brightness."""
+    try:
+        h = hex_color.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        brightness = (r * 299 + g * 587 + b * 114) / 1000
+        return "#000000" if brightness > 140 else "#ffffff"
+    except Exception:
+        return "#000000"
 # ================================================================
 # 🗂 SESSION STATE
 # ================================================================
@@ -344,6 +393,9 @@ if st.sidebar.button("🚪 Log out"):
 # ================================================================
 # 💵 QUICK SALE
 # ================================================================
+# ================================================================
+# 💵 QUICK SALE
+# ================================================================
 if page == "💵 Quick Sale":
     st.title("💵 Quick Sale")
     if st.session_state.current_event:
@@ -354,17 +406,20 @@ if page == "💵 Quick Sale":
     if not all_items:
         st.info("Add items in the Inventory tab first!")
     else:
-        # Normalize category values
+        # Normalize category + series values
         for it in all_items:
             it["category"] = str(it.get("category", "") or "").strip() or "Uncategorized"
+            it["series"] = str(it.get("series", "") or "").strip() or "Other"
 
-        # Get unique categories, sorted with item counts
-        cat_counts = {}
+        # Build category and series counts
+        cat_counts, series_counts = {}, {}
         for it in all_items:
             cat_counts[it["category"]] = cat_counts.get(it["category"], 0) + 1
+            series_counts[it["series"]] = series_counts.get(it["series"], 0) + 1
         categories = sorted(cat_counts.keys())
+        series_list = sorted(series_counts.keys())
 
-        # Get top sellers for the ⭐ shortcut view
+        # Top sellers
         try:
             sale_items_data = get_sale_items()
             if sale_items_data:
@@ -381,15 +436,20 @@ if page == "💵 Quick Sale":
         col1, col2 = st.columns([1.4, 1])
 
         with col1:
-            # ---------- Filter bar ----------
-            filter_options = ["🛍 All Items"]
-            if top_ids:
-                filter_options.append("⭐ Top Sellers")
-            filter_options += [f"{c} ({cat_counts[c]})" for c in categories]
-
-            selected_filter = st.radio(
-                "Category", filter_options,
-                horizontal=True, label_visibility="collapsed")
+            # ---------- Two-level filter ----------
+            f1, f2 = st.columns(2)
+            with f1:
+                cat_options = ["🛍 All Categories"]
+                if top_ids: cat_options.append("⭐ Top Sellers")
+                cat_options += [f"{c} ({cat_counts[c]})" for c in categories]
+                selected_cat = st.selectbox(
+                    "Category", cat_options, key="cat_filter")
+            with f2:
+                series_options = ["🌐 All Series"]
+                series_options += [f"{s} ({series_counts[s]})"
+                                   for s in series_list]
+                selected_series = st.selectbox(
+                    "Series", series_options, key="series_filter")
 
             # Live search
             search = st.text_input(
@@ -397,47 +457,93 @@ if page == "💵 Quick Sale":
                 placeholder="Type a name to filter...",
                 label_visibility="collapsed")
 
-            # Apply filters
-            if selected_filter == "🛍 All Items":
+            # Apply category filter
+            if selected_cat == "🛍 All Categories":
                 items = all_items
-            elif selected_filter == "⭐ Top Sellers":
+            elif selected_cat == "⭐ Top Sellers":
                 items = [i for i in all_items if str(i["id"]) in top_ids]
-                # Preserve top-seller order
                 items.sort(key=lambda x: top_ids.index(str(x["id"]))
                            if str(x["id"]) in top_ids else 999)
             else:
-                # Strip the "(count)" suffix
-                cat_name = selected_filter.rsplit(" (", 1)[0]
+                cat_name = selected_cat.rsplit(" (", 1)[0]
                 items = [i for i in all_items if i["category"] == cat_name]
 
+            # Apply series filter
+            if selected_series != "🌐 All Series":
+                series_name = selected_series.rsplit(" (", 1)[0]
+                items = [i for i in items if i["series"] == series_name]
+
+            # Apply search
             if search.strip():
                 s = search.strip().lower()
                 items = [i for i in items if s in str(i["name"]).lower()]
 
-            st.caption(f"Showing **{len(items)}** item(s)")
+            # Show a chip summary of active filters
+            active_filters = []
+            if selected_cat not in ("🛍 All Categories",):
+                active_filters.append(f"📁 {selected_cat.rsplit(' (', 1)[0]}")
+            if selected_series != "🌐 All Series":
+                active_filters.append(f"🎌 {selected_series.rsplit(' (', 1)[0]}")
+            if search.strip():
+                active_filters.append(f"🔍 '{search.strip()}'")
 
-            # ---------- Item grid ----------
-            if not items:
-                st.info("No items match your filter/search.")
+            if active_filters:
+                st.caption(" • ".join(active_filters) + f"  →  **{len(items)}** items")
             else:
-                # 3-column compact grid
+                st.caption(f"Showing all **{len(items)}** items")
+
+            # ---------- Item grid (colored badges) ----------
+            if not items:
+                st.info("No items match your filters. Try clearing one.")
+            else:
+                custom_colors = get_series_colors()
+                auto_map = {}
+
+                # Legend
+                shown_series = sorted(set(i["series"] for i in items))
+                if len(shown_series) > 1:
+                    legend_html = "<div style='margin-bottom:10px;'>"
+                    for s in shown_series:
+                        c = color_for_series(s, custom_colors, auto_map)
+                        legend_html += (
+                            f"<span style='display:inline-block; padding:3px 10px; "
+                            f"margin:2px; border-radius:12px; background:{c}; "
+                            f"color:{contrast_text(c)}; font-size:12px; "
+                            f"font-weight:600;'>{s}</span>")
+                    legend_html += "</div>"
+                    st.markdown(legend_html, unsafe_allow_html=True)
+
                 cols = st.columns(3)
                 for i, it in enumerate(items):
                     with cols[i % 3]:
+                        c = color_for_series(it["series"], custom_colors, auto_map)
+                        txt = contrast_text(c)
                         low = int(it["stock"]) <= 3
-                        stock_badge = f"⚠️ {it['stock']}" if low else f"stock: {it['stock']}"
+                        stock_badge = (f"⚠️ {it['stock']}" if low
+                                       else f"stock: {it['stock']}")
+
+                        # Colored series badge above the button
+                        st.markdown(
+                            f"<div style='background:{c}; color:{txt}; "
+                            f"padding:4px 10px; border-radius:8px 8px 0 0; "
+                            f"font-size:11px; font-weight:700; text-align:center; "
+                            f"margin-bottom:-4px;'>"
+                            f"{it['series']}</div>",
+                            unsafe_allow_html=True
+                        )
+
                         label = (f"**{it['name']}**\n"
-                                 f"${float(it['price']):.2f}\n"
-                                 f"{stock_badge}")
+                                 f"${float(it['price']):.2f} • {stock_badge}")
+
                         if st.button(label, key=f"add_{it['id']}",
                                      use_container_width=True):
                             found = False
-                            for c in st.session_state.cart:
-                                if c["item_id"] == it["id"]:
-                                    if c["qty"] + 1 > int(it["stock"]):
+                            for c_item in st.session_state.cart:
+                                if c_item["item_id"] == it["id"]:
+                                    if c_item["qty"] + 1 > int(it["stock"]):
                                         st.warning("Not enough stock.")
                                     else:
-                                        c["qty"] += 1
+                                        c_item["qty"] += 1
                                     found = True
                                     break
                             if not found:
@@ -449,6 +555,8 @@ if page == "💵 Quick Sale":
                                     "cost": float(it.get("cost", 0) or 0)
                                 })
                             st.rerun()
+                        st.markdown("<div style='margin-bottom:8px;'></div>",
+                                    unsafe_allow_html=True)
 
         with col2:
             st.subheader("🛒 Cart")
@@ -472,7 +580,6 @@ if page == "💵 Quick Sale":
                         st.session_state.cart.pop(idx)
                         st.rerun()
 
-                # Combo calculation
                 inventory = get_inventory()
                 deals = get_deals()
                 final_total, applied_deals, _ = calculate_combos(
@@ -573,12 +680,15 @@ elif page == "📦 Inventory":
     with tab2:
         with st.form("add_item", clear_on_submit=True):
             name = st.text_input("Name *")
-            category = st.text_input("Category",
-                placeholder="Print, Sticker, Charm, etc.")
-            c1, c2, c3 = st.columns(3)
-            price = c1.number_input("Price ($)", min_value=0.0, step=0.50)
-            cost = c2.number_input("Cost ($)", min_value=0.0, step=0.10)
-            stock = c3.number_input("Stock", min_value=0, step=1)
+            c1, c2 = st.columns(2)
+            category = c1.text_input("Category",
+                placeholder="Charm, Sticker, Print...")
+            series = c2.text_input("Series / Fandom",
+                placeholder="Genshin Impact, Original, etc.")
+            c3, c4, c5 = st.columns(3)
+            price = c3.number_input("Price ($)", min_value=0.0, step=0.50)
+            cost = c4.number_input("Cost ($)", min_value=0.0, step=0.10)
+            stock = c5.number_input("Stock", min_value=0, step=1)
             if st.form_submit_button("➕ Add", type="primary"):
                 if not name.strip():
                     st.error("Name required.")
@@ -586,7 +696,7 @@ elif page == "📦 Inventory":
                     new_id = next_id(get_inventory())
                     inv_ws.append_row([
                         new_id, name.strip(), category.strip(),
-                        price, cost, int(stock)
+                        price, cost, int(stock), series.strip()
                     ])
                     clear_cache()
                     st.success(f"Added {name}!")
@@ -813,7 +923,35 @@ elif page == "📊 Dashboard":
                 if not top_items.empty:
                     st.write("**Top items at this event:**")
                     st.bar_chart(top_items)
+# ============ REVENUE BY SERIES ============
+        if not df_items.empty:
+            st.markdown("---")
+            st.subheader("🎌 Revenue by Series")
 
+            # Pull series info from inventory
+            inv_data = get_inventory()
+            item_series = {}
+            for it in inv_data:
+                item_series[str(it["id"])] = str(it.get("series", "") or "").strip() or "Other"
+
+            df_items["series"] = df_items["item_id"].astype(str).map(item_series).fillna("Other")
+            df_items["revenue_line"] = df_items["unit_price"] * df_items["qty"]
+
+            series_stats = df_items.groupby("series").agg(
+                revenue=("revenue_line", "sum"),
+                qty_sold=("qty", "sum"),
+                unique_items=("item_id", "nunique")
+            ).sort_values("revenue", ascending=False)
+
+            sc1, sc2 = st.columns([1, 1])
+            with sc1:
+                st.bar_chart(series_stats["revenue"])
+            with sc2:
+                display = series_stats.copy()
+                display["revenue"] = display["revenue"].map("${:.2f}".format)
+                st.dataframe(display, use_container_width=True)
+
+            st.caption("💡 See which fandoms are worth making more art for!")
         # ============ TOP SELLERS OVERALL ============
         st.markdown("---")
         if not df_items.empty:
