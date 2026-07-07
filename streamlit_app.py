@@ -1,78 +1,45 @@
 """
 🎨 Artist Alley Inventory & Sales Tracker
-Streamlit app with Google Sheets backend, password protection,
-combo deal auto-pricing, and per-convention revenue tracking.
+Full build with password, combo deals, goals w/ costs, series colors,
+customer catalog, rate-limit friendly caching, batched writes.
 """
 
 import streamlit as st
 import gspread
+from gspread.utils import ValueInputOption
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta, date
 import pandas as pd
 import hmac
+import time
 
 st.set_page_config(page_title="Artist Alley", page_icon="🎨", layout="wide")
-# ---------- Custom teal styling ----------
+
+# ---------- Teal theme polish ----------
 st.markdown("""
 <style>
-    /* Primary buttons */
-    .stButton>button {
-        background-color: #0d9488;
-        color: white;
-        border: none;
-        border-radius: 8px;
-        font-weight: 600;
-        transition: all 0.2s ease;
-    }
-    .stButton>button:hover {
-        background-color: #0f766e;
-        transform: translateY(-1px);
-        box-shadow: 0 4px 12px rgba(13, 148, 136, 0.25);
-    }
-
-    /* Metric cards */
+    .stButton>button { border-radius: 8px; font-weight: 600; }
     div[data-testid="stMetric"] {
-        background-color: #ccfbf1;
-        padding: 16px;
-        border-radius: 12px;
-        border-left: 4px solid #0d9488;
+        background-color: #ccfbf1; padding: 12px;
+        border-radius: 10px; border-left: 4px solid #0d9488;
     }
-    div[data-testid="stMetricValue"] {
-        color: #134e4a;
-        font-weight: 700;
-    }
-
-    /* Success messages */
-    div[data-testid="stAlert"][data-baseweb="notification"] {
-        border-radius: 10px;
-    }
-
-    /* Sidebar accent */
-    section[data-testid="stSidebar"] {
-        border-right: 2px solid #5eead4;
-    }
-
-    /* Headers */
-    h1, h2, h3 {
-        color: #134e4a;
-    }
-
-    /* Tab styling */
-    button[data-baseweb="tab"] {
-        color: #0f766e;
-    }
-    button[data-baseweb="tab"][aria-selected="true"] {
-        color: #0d9488;
-        border-bottom-color: #0d9488 !important;
-    }
+    h1, h2, h3 { color: #134e4a; }
 </style>
 """, unsafe_allow_html=True)
 
 # ================================================================
-# 🔒 PASSWORD PROTECTION
+# 🎪 CUSTOMER VIEW MODE
+# ================================================================
+query_params = st.query_params
+CUSTOMER_MODE = query_params.get("view") == "customer"
+
+# ================================================================
+# 🔒 PASSWORD
 # ================================================================
 def check_password():
-    """Returns True if user entered the correct password."""
+    if CUSTOMER_MODE:
+        return True
+
     def password_entered():
         if hmac.compare_digest(st.session_state["password"],
                                 st.secrets["app_password"]):
@@ -96,7 +63,7 @@ if not check_password():
     st.stop()
 
 # ================================================================
-# 📊 GOOGLE SHEETS CONNECTION
+# 📊 GOOGLE SHEETS CONNECTION (with error handling)
 # ================================================================
 @st.cache_resource
 def get_sheet():
@@ -107,192 +74,81 @@ def get_sheet():
     gc = gspread.authorize(creds)
     return gc.open("Artist Alley Tracker")
 
-sh = get_sheet()
-inv_ws = sh.worksheet("Inventory")
-sales_ws = sh.worksheet("Sales")
-items_ws = sh.worksheet("Sale Items")
-
-# Optional combo deal tabs (won't crash if not yet created)
 try:
-    deals_ws = sh.worksheet("Combo Deals")
-    combo_log_ws = sh.worksheet("Combo Sales Log")
-except Exception:
-    deals_ws = None
-    combo_log_ws = None
+    sh = get_sheet()
+    inv_ws = sh.worksheet("Inventory")
+    sales_ws = sh.worksheet("Sales")
+    items_ws = sh.worksheet("Sale Items")
+except gspread.exceptions.APIError as e:
+    if "429" in str(e) or "Quota" in str(e):
+        st.error("⏱ **Rate limit reached!** Wait 2 minutes and refresh.")
+        st.caption("Google's free API caps at 60 reads/min. "
+                   "Your longer cache TTLs will prevent this after next redeploy.")
+    else:
+        st.error("🚨 Google Sheets connection issue.")
+        st.code(str(e))
+    if st.button("🔄 Try again"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.rerun()
+    st.stop()
+except Exception as e:
+    st.error(f"🚨 Unexpected error connecting to Google Sheets.")
+    st.code(str(e))
+    st.stop()
+
+# Optional tabs
+try: deals_ws = sh.worksheet("Combo Deals")
+except Exception: deals_ws = None
+try: combo_log_ws = sh.worksheet("Combo Sales Log")
+except Exception: combo_log_ws = None
+try: goals_ws = sh.worksheet("Goals")
+except Exception: goals_ws = None
+try: colors_ws = sh.worksheet("Series Colors")
+except Exception: colors_ws = None
 
 # ================================================================
-# 📥 CACHED READS
+# 📥 CACHED READS (rate-limit friendly TTLs)
 # ================================================================
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=600)   # 10 min
 def get_inventory():
     return inv_ws.get_all_records()
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=300)   # 5 min
 def get_sales():
     return sales_ws.get_all_records()
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=300)
 def get_sale_items():
     return items_ws.get_all_records()
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=1800)  # 30 min
 def get_deals():
     if not deals_ws: return []
     return [d for d in deals_ws.get_all_records()
             if str(d.get("active", "")).upper() == "TRUE"]
-            # ================================================================
-# 🎯 GOALS TRACKING
-# ================================================================
-@st.cache_data(ttl=30)
+
+@st.cache_data(ttl=1800)
 def get_goals():
+    if not goals_ws: return []
+    try: return goals_ws.get_all_records()
+    except Exception: return []
+
+@st.cache_data(ttl=1800)
+def get_series_meta():
+    if not colors_ws: return {}, {}
     try:
-        goals_ws = sh.worksheet("Goals")
-        return goals_ws.get_all_records()
+        records = colors_ws.get_all_records()
+        colors, icons = {}, {}
+        for r in records:
+            s = str(r.get("series", "")).strip()
+            if not s: continue
+            if r.get("color"): colors[s] = str(r["color"]).strip()
+            if r.get("icon"): icons[s] = str(r["icon"]).strip()
+        return colors, icons
     except Exception:
-        return []
-def get_goal_for_event(event_name):
-    """Returns dict with all goal + cost fields for the given event."""
-    goals = get_goals()
-    default = {
-        "revenue_goal": 0, "table_cost": 0,
-        "hotel_cost": 0, "travel_cost": 0, "other_costs": 0,
-        "notes": ""
-    }
+        return {}, {}
 
-    def parse_row(g):
-        return {
-            "revenue_goal": float(g.get("revenue_goal", 0) or 0),
-            "table_cost": float(g.get("table_cost", 0) or 0),
-            "hotel_cost": float(g.get("hotel_cost", 0) or 0),
-            "travel_cost": float(g.get("travel_cost", 0) or 0),
-            "other_costs": float(g.get("other_costs", 0) or 0),
-            "notes": str(g.get("notes", "") or ""),
-        }
-
-    for g in goals:
-        if str(g.get("event", "")).strip().lower() == str(event_name).strip().lower():
-            return parse_row(g)
-    for g in goals:
-        if str(g.get("event", "")).strip().lower() == "_default_":
-            return parse_row(g)
-    return default
-
-def render_goal_progress(event_name, compact=False):
-    """Renders the goal progress bar + milestones with full cost breakdown."""
-    goal = get_goal_for_event(event_name)
-    if goal["revenue_goal"] <= 0 and goal["table_cost"] == 0:
-        return
-
-    current = event_revenue(event_name)
-
-    # Calculate totals
-    total_costs = (goal["table_cost"] + goal["hotel_cost"]
-                   + goal["travel_cost"] + goal["other_costs"])
-    net_profit = current - total_costs
-
-    # Progress calculation
-    pct = min(current / goal["revenue_goal"], 1.0) if goal["revenue_goal"] else 0
-    remaining = max(0, goal["revenue_goal"] - current)
-
-    # Milestone status
-    hit_table = goal["table_cost"] > 0 and current >= goal["table_cost"]
-    hit_breakeven = total_costs > 0 and current >= total_costs
-    hit_half = current >= goal["revenue_goal"] * 0.5
-    hit_goal = current >= goal["revenue_goal"]
-    hit_stretch = current >= goal["revenue_goal"] * 1.25
-
-    # Header
-    if compact:
-        profit_display = (f"💵 +${net_profit:.0f}" if net_profit >= 0
-                          else f"⚠️ -${abs(net_profit):.0f}")
-        st.markdown(f"**🎯 {event_name}:** "
-                    f"${current:.0f} / ${goal['revenue_goal']:.0f}  "
-                    f"({pct*100:.0f}%)  •  {profit_display}")
-    else:
-        st.subheader(f"🎯 Goal Progress — {event_name}")
-
-    st.progress(pct)
-
-    # Metrics row 1: revenue focus
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Earned so far", f"${current:.2f}")
-    m2.metric("Revenue goal", f"${goal['revenue_goal']:.2f}")
-    m3.metric("Remaining", f"${remaining:.2f}" if not hit_goal else "✅ Hit!")
-    m4.metric("% of goal", f"{pct*100:.0f}%")
-
-    # Metrics row 2: profit focus (only in detailed view)
-    if not compact and total_costs > 0:
-        st.markdown("### 💰 Profit Picture")
-        p1, p2, p3, p4 = st.columns(4)
-        p1.metric("Total costs", f"${total_costs:.2f}")
-        p2.metric("Break-even at", f"${total_costs:.2f}")
-        p3.metric("Net profit",
-                  f"${net_profit:.2f}",
-                  delta=f"${net_profit:.2f}",
-                  delta_color="normal" if net_profit >= 0 else "inverse")
-        margin = (net_profit / current * 100) if current > 0 else 0
-        p4.metric("Profit margin", f"{margin:.0f}%")
-
-        # Cost breakdown
-        with st.expander("📋 Cost breakdown"):
-            cost_items = []
-            if goal["table_cost"] > 0:
-                cost_items.append(("🎪 Table fee", goal["table_cost"]))
-            if goal["hotel_cost"] > 0:
-                cost_items.append(("🏨 Hotel", goal["hotel_cost"]))
-            if goal["travel_cost"] > 0:
-                cost_items.append(("✈️ Travel", goal["travel_cost"]))
-            if goal["other_costs"] > 0:
-                cost_items.append(("🍜 Other (food/supplies)", goal["other_costs"]))
-            for label, amt in cost_items:
-                st.write(f"{label}: **${amt:.2f}**")
-            st.write(f"---")
-            st.write(f"**Total costs: ${total_costs:.2f}**")
-
-    # Milestones
-    if not compact:
-        st.markdown("### 🏆 Milestones")
-        milestones = []
-        if goal["table_cost"] > 0:
-            milestones.append((hit_table, f"Table paid off (${goal['table_cost']:.0f})"))
-        if total_costs > 0 and total_costs != goal["table_cost"]:
-            milestones.append((hit_breakeven, f"💰 BREAK EVEN (${total_costs:.0f})"))
-        milestones.append((hit_half,
-            f"Halfway to goal (${goal['revenue_goal']*0.5:.0f})"))
-        milestones.append((hit_goal,
-            f"🎉 Goal reached (${goal['revenue_goal']:.0f})"))
-        milestones.append((hit_stretch,
-            f"🚀 Stretch 125% (${goal['revenue_goal']*1.25:.0f})"))
-
-        for hit, label in milestones:
-            icon = "✅" if hit else "⬜"
-            st.markdown(f"- {icon} {label}")
-
-    # Celebrations
-    if hit_stretch:
-        if st.session_state.get("celebrated_stretch") != event_name:
-            st.balloons()
-            st.session_state["celebrated_stretch"] = event_name
-        st.success(f"🚀 CRUSHING IT — you're at 125%+ of your goal!")
-    elif hit_goal:
-        if st.session_state.get("celebrated_goal") != event_name:
-            st.balloons()
-            st.session_state["celebrated_goal"] = event_name
-        st.success(f"🎉 Goal reached! Everything from here is bonus.")
-    elif hit_breakeven and total_costs > 0:
-        if st.session_state.get("celebrated_breakeven") != event_name:
-            st.balloons()
-            st.session_state["celebrated_breakeven"] = event_name
-        st.success(f"💰 BROKE EVEN! Every sale from here is pure profit. 🎉")
-    elif hit_table and goal["table_cost"] > 0:
-        st.info(f"✅ Table cost covered — now working toward covering the trip!")
-
-    if goal["notes"]:
-        st.caption(f"📝 {goal['notes']}")
-
-# ================================================================
-# 🔧 UTILITIES
-# ================================================================
 def clear_cache():
     st.cache_data.clear()
 
@@ -301,24 +157,41 @@ def next_id(records):
     return max((int(r.get("id", 0) or 0) for r in records), default=0) + 1
 
 # ================================================================
+# 🎨 SERIES COLOR HELPERS
+# ================================================================
+FALLBACK_PALETTE = [
+    "#14b8a6", "#eab308", "#8b5cf6", "#ec4899", "#0ea5e9",
+    "#22c55e", "#f97316", "#ef4444", "#a855f7", "#06b6d4",
+    "#84cc16", "#f43f5e",
+]
+
+def color_for_series(series_name, custom_colors, auto_map):
+    if series_name in custom_colors:
+        return custom_colors[series_name]
+    if series_name not in auto_map:
+        idx = abs(hash(series_name)) % len(FALLBACK_PALETTE)
+        auto_map[series_name] = FALLBACK_PALETTE[idx]
+    return auto_map[series_name]
+
+def contrast_text(hex_color):
+    try:
+        h = hex_color.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        brightness = (r*299 + g*587 + b*114) / 1000
+        return "#000000" if brightness > 140 else "#ffffff"
+    except Exception:
+        return "#000000"
+
+# ================================================================
 # 🎁 COMBO DEAL LOGIC
 # ================================================================
 def calculate_combos(cart, inventory, deals):
-    """
-    Given a cart and active deals, return:
-    - adjusted_total: final price after all combos
-    - applied_deals: list of {deal_id, deal_name, discount_amount, items_qty}
-    - line_details: reserved for future receipt display
-    """
     if not cart:
         return 0, [], []
-
     raw_total = sum(c["qty"] * c["price"] for c in cart)
-
     if not deals:
         return raw_total, [], []
 
-    # Attach categories from inventory
     inv_by_id = {str(i["id"]): i for i in inventory}
     for c in cart:
         inv_item = inv_by_id.get(str(c["item_id"]), {})
@@ -327,8 +200,6 @@ def calculate_combos(cart, inventory, deals):
     total_discount = 0
     applied = []
     remaining = {c["item_id"]: c["qty"] for c in cart}
-
-    # Priority: specific bundles first, then category/qty, then cart-wide
     priority = {"bundle": 0, "qty_same": 1, "bogo": 2,
                 "mix_category": 3, "cart_percent": 4}
     deals_sorted = sorted(deals,
@@ -340,7 +211,6 @@ def calculate_combos(cart, inventory, deals):
         combo_price = float(d.get("combo_price", 0) or 0)
         discount_pct = float(d.get("discount_pct", 0) or 0)
 
-        # ---- Same-item quantity discount ----
         if dtype == "qty_same":
             cat = d.get("trigger_category", "")
             for c in cart:
@@ -349,19 +219,15 @@ def calculate_combos(cart, inventory, deals):
                 sets = available // trigger_qty if trigger_qty else 0
                 if sets > 0:
                     normal = sets * trigger_qty * c["price"]
-                    discounted = sets * combo_price
-                    disc = normal - discounted
+                    disc = normal - (sets * combo_price)
                     if disc > 0:
                         total_discount += disc
-                        applied.append({
-                            "deal_id": d["deal_id"],
+                        applied.append({"deal_id": d["deal_id"],
                             "deal_name": d["deal_name"],
                             "items_qty": sets * trigger_qty,
-                            "discount_amount": disc
-                        })
+                            "discount_amount": disc})
                         remaining[c["item_id"]] -= sets * trigger_qty
 
-        # ---- Mix & match category ----
         elif dtype == "mix_category":
             cat = d.get("trigger_category", "")
             eligible = [c for c in cart
@@ -378,16 +244,13 @@ def calculate_combos(cart, inventory, deals):
                 disc = normal - combo_price
                 if disc > 0:
                     total_discount += disc
-                    applied.append({
-                        "deal_id": d["deal_id"],
+                    applied.append({"deal_id": d["deal_id"],
                         "deal_name": d["deal_name"],
                         "items_qty": trigger_qty,
-                        "discount_amount": disc
-                    })
+                        "discount_amount": disc})
                     for g in group:
                         remaining[g["item_id"]] -= 1
 
-        # ---- Bundle (specific item IDs) ----
         elif dtype == "bundle":
             ids = [i.strip() for i in
                    str(d.get("trigger_item_ids", "")).split(",") if i.strip()]
@@ -401,21 +264,16 @@ def calculate_combos(cart, inventory, deals):
                 normal_unit = sum(
                     next((c["price"] for c in cart
                           if str(c["item_id"]) == i), 0) for i in ids)
-                normal = normal_unit * sets
-                discounted = sets * combo_price
-                disc = normal - discounted
+                disc = (normal_unit * sets) - (sets * combo_price)
                 if disc > 0:
                     total_discount += disc
-                    applied.append({
-                        "deal_id": d["deal_id"],
+                    applied.append({"deal_id": d["deal_id"],
                         "deal_name": d["deal_name"],
                         "items_qty": sets * len(ids),
-                        "discount_amount": disc
-                    })
+                        "discount_amount": disc})
                     for i in ids:
                         remaining[int(i)] -= sets
 
-        # ---- BOGO (cheapest free per group of trigger_qty) ----
         elif dtype == "bogo":
             cat = d.get("trigger_category", "")
             eligible = []
@@ -430,127 +288,247 @@ def calculate_combos(cart, inventory, deals):
                 disc = group[0] * (discount_pct / 100)
                 if disc > 0:
                     total_discount += disc
-                    applied.append({
-                        "deal_id": d["deal_id"],
+                    applied.append({"deal_id": d["deal_id"],
                         "deal_name": d["deal_name"],
                         "items_qty": trigger_qty,
-                        "discount_amount": disc
-                    })
+                        "discount_amount": disc})
 
-        # ---- Cart-wide percentage ----
         elif dtype == "cart_percent":
             threshold = combo_price
             if raw_total - total_discount >= threshold:
                 disc = (raw_total - total_discount) * (discount_pct / 100)
                 if disc > 0:
                     total_discount += disc
-                    applied.append({
-                        "deal_id": d["deal_id"],
+                    applied.append({"deal_id": d["deal_id"],
                         "deal_name": d["deal_name"],
                         "items_qty": sum(c["qty"] for c in cart),
-                        "discount_amount": disc
-                    })
+                        "discount_amount": disc})
 
     return raw_total - total_discount, applied, []
+
 # ================================================================
-# 🎨 SERIES COLOR MAPPING
+# 🎯 GOALS HELPERS (including event_revenue!)
 # ================================================================
-# Curated fallback palette (con-friendly, high contrast)
-FALLBACK_PALETTE = [
-    "#14b8a6",  # teal
-    "#eab308",  # amber
-    "#8b5cf6",  # purple
-    "#ec4899",  # pink
-    "#0ea5e9",  # sky
-    "#22c55e",  # green
-    "#f97316",  # orange
-    "#ef4444",  # red
-    "#a855f7",  # violet
-    "#06b6d4",  # cyan
-    "#84cc16",  # lime
-    "#f43f5e",  # rose
-]
+def event_revenue(event_name):
+    """Total revenue for a specific event so far."""
+    sales = get_sales()
+    if not sales: return 0
+    df = pd.DataFrame(sales)
+    df["total"] = pd.to_numeric(df["total"], errors="coerce").fillna(0)
+    df["event"] = df.get("event", "").astype(str)
+    return df[df["event"] == event_name]["total"].sum()
 
-@st.cache_data(ttl=60)
-def get_series_colors():
-    """Load custom colors from optional Series Colors tab."""
-    try:
-        colors_ws = sh.worksheet("Series Colors")
-        records = colors_ws.get_all_records()
-        return {str(r["series"]).strip(): str(r["color"]).strip()
-                for r in records
-                if r.get("series") and r.get("color")}
-    except Exception:
-        return {}
+def get_goal_for_event(event_name):
+    goals = get_goals()
+    default = {"revenue_goal": 0, "table_cost": 0,
+               "hotel_cost": 0, "travel_cost": 0, "other_costs": 0, "notes": ""}
 
-def color_for_series(series_name, custom_colors, auto_map):
-    """Return a hex color for a series — custom first, else auto."""
-    if series_name in custom_colors:
-        return custom_colors[series_name]
-    if series_name not in auto_map:
-        # Stable hash-based assignment so a series always gets the same color
-        idx = abs(hash(series_name)) % len(FALLBACK_PALETTE)
-        auto_map[series_name] = FALLBACK_PALETTE[idx]
-    return auto_map[series_name]
+    def parse(g):
+        return {
+            "revenue_goal": float(g.get("revenue_goal", 0) or 0),
+            "table_cost": float(g.get("table_cost", 0) or 0),
+            "hotel_cost": float(g.get("hotel_cost", 0) or 0),
+            "travel_cost": float(g.get("travel_cost", 0) or 0),
+            "other_costs": float(g.get("other_costs", 0) or 0),
+            "notes": str(g.get("notes", "") or ""),
+        }
 
-def contrast_text(hex_color):
-    """Pick black or white text based on background brightness."""
-    try:
-        h = hex_color.lstrip("#")
-        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-        brightness = (r * 299 + g * 587 + b * 114) / 1000
-        return "#000000" if brightness > 140 else "#ffffff"
-    except Exception:
-        return "#000000"
+    for g in goals:
+        if str(g.get("event", "")).strip().lower() == str(event_name).strip().lower():
+            return parse(g)
+    for g in goals:
+        if str(g.get("event", "")).strip().lower() == "_default_":
+            return parse(g)
+    return default
+
+def render_goal_progress(event_name, compact=False):
+    goal = get_goal_for_event(event_name)
+    if goal["revenue_goal"] <= 0 and goal["table_cost"] == 0:
+        return
+
+    current = event_revenue(event_name)
+    total_costs = (goal["table_cost"] + goal["hotel_cost"]
+                   + goal["travel_cost"] + goal["other_costs"])
+    net_profit = current - total_costs
+    pct = min(current / goal["revenue_goal"], 1.0) if goal["revenue_goal"] else 0
+    remaining = max(0, goal["revenue_goal"] - current)
+
+    hit_table = goal["table_cost"] > 0 and current >= goal["table_cost"]
+    hit_breakeven = total_costs > 0 and current >= total_costs
+    hit_half = current >= goal["revenue_goal"] * 0.5
+    hit_goal = current >= goal["revenue_goal"]
+    hit_stretch = current >= goal["revenue_goal"] * 1.25
+
+    if compact:
+        profit_display = (f"💵 +${net_profit:.0f}" if net_profit >= 0
+                          else f"⚠️ -${abs(net_profit):.0f}")
+        st.markdown(f"**🎯 {event_name}:** "
+                    f"${current:.0f} / ${goal['revenue_goal']:.0f}  "
+                    f"({pct*100:.0f}%)  •  {profit_display}")
+    else:
+        st.subheader(f"🎯 Goal Progress — {event_name}")
+
+    st.progress(pct)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Earned", f"${current:.2f}")
+    m2.metric("Goal", f"${goal['revenue_goal']:.2f}")
+    m3.metric("Remaining", f"${remaining:.2f}" if not hit_goal else "✅ Hit!")
+    m4.metric("% of goal", f"{pct*100:.0f}%")
+
+    if not compact and total_costs > 0:
+        st.markdown("### 💰 Profit Picture")
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Total costs", f"${total_costs:.2f}")
+        p2.metric("Break-even at", f"${total_costs:.2f}")
+        p3.metric("Net profit", f"${net_profit:.2f}",
+                  delta_color="normal" if net_profit >= 0 else "inverse")
+        margin = (net_profit / current * 100) if current > 0 else 0
+        p4.metric("Profit margin", f"{margin:.0f}%")
+
+        with st.expander("📋 Cost breakdown"):
+            if goal["table_cost"] > 0: st.write(f"🎪 Table fee: **${goal['table_cost']:.2f}**")
+            if goal["hotel_cost"] > 0: st.write(f"🏨 Hotel: **${goal['hotel_cost']:.2f}**")
+            if goal["travel_cost"] > 0: st.write(f"✈️ Travel: **${goal['travel_cost']:.2f}**")
+            if goal["other_costs"] > 0: st.write(f"🍜 Other: **${goal['other_costs']:.2f}**")
+            st.write(f"**Total: ${total_costs:.2f}**")
+
+    if not compact:
+        st.markdown("### 🏆 Milestones")
+        milestones = []
+        if goal["table_cost"] > 0:
+            milestones.append((hit_table, f"Table paid off (${goal['table_cost']:.0f})"))
+        if total_costs > 0 and total_costs != goal["table_cost"]:
+            milestones.append((hit_breakeven, f"💰 BREAK EVEN (${total_costs:.0f})"))
+        milestones.append((hit_half, f"Halfway to goal (${goal['revenue_goal']*0.5:.0f})"))
+        milestones.append((hit_goal, f"🎉 Goal reached (${goal['revenue_goal']:.0f})"))
+        milestones.append((hit_stretch, f"🚀 Stretch 125% (${goal['revenue_goal']*1.25:.0f})"))
+        for hit, label in milestones:
+            st.markdown(f"- {'✅' if hit else '⬜'} {label}")
+
+    if hit_stretch:
+        if st.session_state.get("celebrated_stretch") != event_name:
+            st.balloons(); st.session_state["celebrated_stretch"] = event_name
+        st.success("🚀 CRUSHING IT — 125%+ of your goal!")
+    elif hit_goal:
+        if st.session_state.get("celebrated_goal") != event_name:
+            st.balloons(); st.session_state["celebrated_goal"] = event_name
+        st.success("🎉 Goal reached!")
+    elif hit_breakeven and total_costs > 0:
+        if st.session_state.get("celebrated_breakeven") != event_name:
+            st.balloons(); st.session_state["celebrated_breakeven"] = event_name
+        st.success("💰 BROKE EVEN! Every sale from here is profit.")
+    elif hit_table and goal["table_cost"] > 0:
+        st.info("✅ Table cost covered!")
+
+    if goal["notes"]:
+        st.caption(f"📝 {goal['notes']}")
+
 # ================================================================
 # 🗂 SESSION STATE
 # ================================================================
-if "cart" not in st.session_state:
-    st.session_state.cart = []
-if "current_event" not in st.session_state:
-    st.session_state.current_event = ""
+if "cart" not in st.session_state: st.session_state.cart = []
+if "current_event" not in st.session_state: st.session_state.current_event = ""
+
+# ================================================================
+# 👀 CUSTOMER VIEW (short-circuits the rest of the app)
+# ================================================================
+if CUSTOMER_MODE:
+    st.markdown("""<style>
+        #MainMenu, header, footer {visibility: hidden;}
+        [data-testid="stSidebar"] {display: none;}
+    </style>""", unsafe_allow_html=True)
+
+    st.title("🎨 Browse the Menu")
+    st.caption("Tap the ✨ combo deals badge when ordering!")
+
+    all_items = [i for i in get_inventory() if int(i.get("stock", 0) or 0) > 0]
+    if not all_items:
+        st.info("No items available right now.")
+        st.stop()
+
+    for it in all_items:
+        it["category"] = str(it.get("category", "") or "").strip() or "Other"
+        it["series"] = str(it.get("series", "") or "").strip() or "Other"
+        it["image_url"] = str(it.get("image_url", "") or "").strip()
+
+    cats = sorted(set(i["category"] for i in all_items))
+    ser = sorted(set(i["series"] for i in all_items))
+
+    f1, f2 = st.columns(2)
+    sel_cat = f1.selectbox("Category", ["🛍 All"] + cats)
+    sel_ser = f2.selectbox("Series", ["🌐 All"] + ser)
+    search = st.text_input("🔍 Search", "")
+
+    items = all_items
+    if sel_cat != "🛍 All": items = [i for i in items if i["category"] == sel_cat]
+    if sel_ser != "🌐 All": items = [i for i in items if i["series"] == sel_ser]
+    if search.strip():
+        s = search.strip().lower()
+        items = [i for i in items if s in str(i["name"]).lower()]
+
+    st.markdown(f"**{len(items)} items**")
+    st.markdown("---")
+
+    custom_colors, custom_icons = get_series_meta()
+    auto_map = {}
+    for i in range(0, len(items), 3):
+        cols = st.columns(3)
+        for col, it in zip(cols, items[i:i+3]):
+            with col:
+                c = color_for_series(it["series"], custom_colors, auto_map)
+                txt = contrast_text(c)
+                icon = custom_icons.get(it["series"], "")
+                st.markdown(
+                    f"<div style='background:{c};color:{txt};padding:6px;"
+                    f"border-radius:8px 8px 0 0;text-align:center;font-weight:700;'>"
+                    f"{icon} {it['series']}</div>", unsafe_allow_html=True)
+                if it["image_url"]:
+                    try: st.image(it["image_url"], width="stretch")
+                    except Exception: st.markdown("🎨")
+                low = int(it["stock"]) <= 3
+                stock = "⚠️ Last few!" if low else ""
+                st.markdown(
+                    f"<div style='text-align:center;padding:6px;"
+                    f"background:white;border:1px solid #e2e8f0;'>"
+                    f"<b>{it['name']}</b><br>"
+                    f"<span style='color:#0d9488;font-size:18px;font-weight:700;'>"
+                    f"${float(it['price']):.2f}</span><br>"
+                    f"<small style='color:#dc2626;'>{stock}</small></div>",
+                    unsafe_allow_html=True)
+                st.markdown("<br>", unsafe_allow_html=True)
+    st.stop()
 
 # ================================================================
 # 📋 SIDEBAR
 # ================================================================
 st.sidebar.title("🎨 Artist Alley")
 page = st.sidebar.radio("Go to", [
-    "💵 Quick Sale",
-    "📦 Inventory",
-    "🎁 Combo Deals",
-     "🎯 Goals",
-    "📜 Sales History",
-    "📊 Dashboard"
+    "💵 Quick Sale", "📦 Inventory", "🎁 Combo Deals",
+    "🎯 Goals", "📜 Sales History", "📊 Dashboard"
 ])
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**🏪 Current Event**")
 st.session_state.current_event = st.sidebar.text_input(
-    "Set once per con",
-    value=st.session_state.current_event,
-    placeholder="e.g. Anime North 2026",
-    label_visibility="collapsed")
+    "Event", value=st.session_state.current_event,
+    placeholder="e.g. Anime North 2026", label_visibility="collapsed")
 if st.session_state.current_event:
-    st.sidebar.caption(f"Tagging sales as: **{st.session_state.current_event}**")
+    st.sidebar.caption(f"Tagging: **{st.session_state.current_event}**")
 
 st.sidebar.markdown("---")
 if st.sidebar.button("🔄 Refresh data"):
     clear_cache(); st.rerun()
 if st.sidebar.button("🚪 Log out"):
-    st.session_state["password_correct"] = False
-    st.rerun()
+    st.session_state["password_correct"] = False; st.rerun()
 
-# ================================================================
-# 💵 QUICK SALE
-# ================================================================
 # ================================================================
 # 💵 QUICK SALE
 # ================================================================
 if page == "💵 Quick Sale":
     st.title("💵 Quick Sale")
     if st.session_state.current_event:
-        st.caption(f"📍 Current event: **{st.session_state.current_event}**")
-        # 🎯 Compact goal tracker at top
+        st.caption(f"📍 {st.session_state.current_event}")
         render_goal_progress(st.session_state.current_event, compact=True)
         st.markdown("---")
 
@@ -559,12 +537,10 @@ if page == "💵 Quick Sale":
     if not all_items:
         st.info("Add items in the Inventory tab first!")
     else:
-        # Normalize category + series values
         for it in all_items:
             it["category"] = str(it.get("category", "") or "").strip() or "Uncategorized"
             it["series"] = str(it.get("series", "") or "").strip() or "Other"
 
-        # Build category and series counts
         cat_counts, series_counts = {}, {}
         for it in all_items:
             cat_counts[it["category"]] = cat_counts.get(it["category"], 0) + 1
@@ -572,144 +548,69 @@ if page == "💵 Quick Sale":
         categories = sorted(cat_counts.keys())
         series_list = sorted(series_counts.keys())
 
-        # Top sellers
-        try:
-            sale_items_data = get_sale_items()
-            if sale_items_data:
-                df_si = pd.DataFrame(sale_items_data)
-                df_si["qty"] = pd.to_numeric(df_si["qty"], errors="coerce").fillna(0)
-                top_ids = (df_si.groupby("item_id")["qty"].sum()
-                           .sort_values(ascending=False).head(12).index.tolist())
-                top_ids = [str(t) for t in top_ids]
-            else:
-                top_ids = []
-        except Exception:
-            top_ids = []
-
         col1, col2 = st.columns([1.4, 1])
 
         with col1:
-            # ---------- Two-level filter ----------
             f1, f2 = st.columns(2)
-            with f1:
-                cat_options = ["🛍 All Categories"]
-                if top_ids: cat_options.append("⭐ Top Sellers")
-                cat_options += [f"{c} ({cat_counts[c]})" for c in categories]
-                selected_cat = st.selectbox(
-                    "Category", cat_options, key="cat_filter")
-            with f2:
-                series_options = ["🌐 All Series"]
-                series_options += [f"{s} ({series_counts[s]})"
-                                   for s in series_list]
-                selected_series = st.selectbox(
-                    "Series", series_options, key="series_filter")
+            cat_options = ["🛍 All"] + [f"{c} ({cat_counts[c]})" for c in categories]
+            selected_cat = f1.selectbox("Category", cat_options)
+            series_options = ["🌐 All"] + [f"{s} ({series_counts[s]})" for s in series_list]
+            selected_series = f2.selectbox("Series", series_options)
+            search = st.text_input("🔍 Search", "", placeholder="Type name...",
+                                    label_visibility="collapsed")
 
-            # Live search
-            search = st.text_input(
-                "🔍 Search", "",
-                placeholder="Type a name to filter...",
-                label_visibility="collapsed")
-
-            # Apply category filter
-            if selected_cat == "🛍 All Categories":
-                items = all_items
-            elif selected_cat == "⭐ Top Sellers":
-                items = [i for i in all_items if str(i["id"]) in top_ids]
-                items.sort(key=lambda x: top_ids.index(str(x["id"]))
-                           if str(x["id"]) in top_ids else 999)
-            else:
+            items = all_items
+            if selected_cat != "🛍 All":
                 cat_name = selected_cat.rsplit(" (", 1)[0]
-                items = [i for i in all_items if i["category"] == cat_name]
-
-            # Apply series filter
-            if selected_series != "🌐 All Series":
+                items = [i for i in items if i["category"] == cat_name]
+            if selected_series != "🌐 All":
                 series_name = selected_series.rsplit(" (", 1)[0]
                 items = [i for i in items if i["series"] == series_name]
-
-            # Apply search
             if search.strip():
                 s = search.strip().lower()
                 items = [i for i in items if s in str(i["name"]).lower()]
 
-            # Show a chip summary of active filters
-            active_filters = []
-            if selected_cat not in ("🛍 All Categories",):
-                active_filters.append(f"📁 {selected_cat.rsplit(' (', 1)[0]}")
-            if selected_series != "🌐 All Series":
-                active_filters.append(f"🎌 {selected_series.rsplit(' (', 1)[0]}")
-            if search.strip():
-                active_filters.append(f"🔍 '{search.strip()}'")
+            st.caption(f"Showing **{len(items)}** items")
 
-            if active_filters:
-                st.caption(" • ".join(active_filters) + f"  →  **{len(items)}** items")
-            else:
-                st.caption(f"Showing all **{len(items)}** items")
-
-            # ---------- Item grid (colored badges) ----------
             if not items:
-                st.info("No items match your filters. Try clearing one.")
+                st.info("No items match.")
             else:
-                custom_colors = get_series_colors()
+                custom_colors, custom_icons = get_series_meta()
                 auto_map = {}
-
-                # Legend
-                shown_series = sorted(set(i["series"] for i in items))
-                if len(shown_series) > 1:
-                    legend_html = "<div style='margin-bottom:10px;'>"
-                    for s in shown_series:
-                        c = color_for_series(s, custom_colors, auto_map)
-                        legend_html += (
-                            f"<span style='display:inline-block; padding:3px 10px; "
-                            f"margin:2px; border-radius:12px; background:{c}; "
-                            f"color:{contrast_text(c)}; font-size:12px; "
-                            f"font-weight:600;'>{s}</span>")
-                    legend_html += "</div>"
-                    st.markdown(legend_html, unsafe_allow_html=True)
 
                 cols = st.columns(3)
                 for i, it in enumerate(items):
                     with cols[i % 3]:
                         c = color_for_series(it["series"], custom_colors, auto_map)
                         txt = contrast_text(c)
-                        low = int(it["stock"]) <= 3
-                        stock_badge = (f"⚠️ {it['stock']}" if low
-                                       else f"stock: {it['stock']}")
-
-                        # Colored series badge above the button
+                        icon = custom_icons.get(it["series"], "")
+                        badge = f"{icon} {it['series']}".strip()
                         st.markdown(
-                            f"<div style='background:{c}; color:{txt}; "
-                            f"padding:4px 10px; border-radius:8px 8px 0 0; "
-                            f"font-size:11px; font-weight:700; text-align:center; "
-                            f"margin-bottom:-4px;'>"
-                            f"{it['series']}</div>",
-                            unsafe_allow_html=True
-                        )
+                            f"<div style='background:{c};color:{txt};"
+                            f"padding:4px 8px;border-radius:6px 6px 0 0;"
+                            f"font-size:11px;font-weight:700;text-align:center;"
+                            f"margin-bottom:-4px;'>{badge}</div>",
+                            unsafe_allow_html=True)
 
-                        label = (f"**{it['name']}**\n"
-                                 f"${float(it['price']):.2f} • {stock_badge}")
-
-                        if st.button(label, key=f"add_{it['id']}",
-                                     use_container_width=True):
+                        low = int(it["stock"]) <= 3
+                        stock_badge = f"⚠️ {it['stock']}" if low else f"stock: {it['stock']}"
+                        label = f"**{it['name']}**\n${float(it['price']):.2f} • {stock_badge}"
+                        if st.button(label, key=f"add_{it['id']}", width="stretch"):
                             found = False
-                            for c_item in st.session_state.cart:
-                                if c_item["item_id"] == it["id"]:
-                                    if c_item["qty"] + 1 > int(it["stock"]):
+                            for cc in st.session_state.cart:
+                                if cc["item_id"] == it["id"]:
+                                    if cc["qty"] + 1 > int(it["stock"]):
                                         st.warning("Not enough stock.")
                                     else:
-                                        c_item["qty"] += 1
-                                    found = True
-                                    break
+                                        cc["qty"] += 1
+                                    found = True; break
                             if not found:
                                 st.session_state.cart.append({
-                                    "item_id": it["id"],
-                                    "name": it["name"],
-                                    "qty": 1,
-                                    "price": float(it["price"]),
-                                    "cost": float(it.get("cost", 0) or 0)
-                                })
+                                    "item_id": it["id"], "name": it["name"],
+                                    "qty": 1, "price": float(it["price"]),
+                                    "cost": float(it.get("cost", 0) or 0)})
                             st.rerun()
-                        st.markdown("<div style='margin-bottom:8px;'></div>",
-                                    unsafe_allow_html=True)
+                        st.markdown("<br>", unsafe_allow_html=True)
 
         with col2:
             st.subheader("🛒 Cart")
@@ -718,26 +619,21 @@ if page == "💵 Quick Sale":
             else:
                 raw_total = 0
                 for idx, c in enumerate(st.session_state.cart):
-                    sub = c["qty"] * c["price"]
-                    raw_total += sub
+                    sub = c["qty"] * c["price"]; raw_total += sub
                     cc = st.columns([3, 1, 1, 1])
                     cc[0].write(f"**{c['name']}**")
-                    new_qty = cc[1].number_input(
-                        "Qty", min_value=1, value=c["qty"],
+                    new_qty = cc[1].number_input("Qty", min_value=1, value=c["qty"],
                         key=f"qty_{idx}", label_visibility="collapsed")
                     if new_qty != c["qty"]:
-                        st.session_state.cart[idx]["qty"] = new_qty
-                        st.rerun()
+                        st.session_state.cart[idx]["qty"] = new_qty; st.rerun()
                     cc[2].write(f"${sub:.2f}")
                     if cc[3].button("✕", key=f"rm_{idx}"):
-                        st.session_state.cart.pop(idx)
-                        st.rerun()
+                        st.session_state.cart.pop(idx); st.rerun()
 
                 inventory = get_inventory()
                 deals = get_deals()
                 final_total, applied_deals, _ = calculate_combos(
-                    [dict(c) for c in st.session_state.cart],
-                    inventory, deals)
+                    [dict(c) for c in st.session_state.cart], inventory, deals)
 
                 st.markdown("---")
                 st.write(f"Subtotal: ${raw_total:.2f}")
@@ -745,112 +641,106 @@ if page == "💵 Quick Sale":
                 if applied_deals:
                     st.success("🎉 Combo deals applied!")
                     for d in applied_deals:
-                        st.caption(f"✨ **{d['deal_name']}** — save "
-                                   f"${d['discount_amount']:.2f}")
-                    savings = raw_total - final_total
-                    st.write(f"💰 Total savings: **${savings:.2f}**")
+                        st.caption(f"✨ **{d['deal_name']}** — save ${d['discount_amount']:.2f}")
+                    st.write(f"💰 Total savings: **${raw_total - final_total:.2f}**")
 
                 st.markdown(f"### Total: **${final_total:.2f}**")
 
                 override = st.checkbox("Manually adjust total")
                 if override:
-                    final_total = st.number_input(
-                        "Final total ($)", min_value=0.0,
-                        value=float(final_total), step=0.50)
+                    final_total = st.number_input("Final total ($)",
+                        min_value=0.0, value=float(final_total), step=0.50)
 
-                payment = st.selectbox("Payment",
-                    ["Cash", "Card", "E-transfer", "Other"])
+                payment = st.selectbox("Payment", ["Cash", "Card", "E-transfer", "Other"])
                 notes = st.text_input("Notes (optional)")
 
                 b1, b2 = st.columns(2)
-                if b1.button("✅ Complete Sale", type="primary",
-                             use_container_width=True):
+                if b1.button("✅ Complete Sale", type="primary", width="stretch"):
+                    # BATCHED WRITES to stay under quota
                     sales = get_sales()
                     sale_id = next_id(sales)
                     sales_ws.append_row([
-                        sale_id,
-                        datetime.now().isoformat(timespec="seconds"),
-                        payment,
-                        round(final_total, 2),
-                        notes,
+                        sale_id, datetime.now().isoformat(timespec="seconds"),
+                        payment, round(final_total, 2), notes,
                         st.session_state.current_event
-                    ])
+                    ], value_input_option=ValueInputOption.user_entered)
 
                     sale_item_records = get_sale_items()
                     next_item_row_id = next_id(sale_item_records)
-
+                    item_rows = []
                     for c in st.session_state.cart:
-                        items_ws.append_row([
-                            next_item_row_id, sale_id, c["item_id"],
-                            c["name"], c["qty"], c["price"], c["cost"]
-                        ])
+                        item_rows.append([next_item_row_id, sale_id, c["item_id"],
+                            c["name"], c["qty"], c["price"], c["cost"]])
                         next_item_row_id += 1
+                    if item_rows:
+                        items_ws.append_rows(item_rows,
+                            value_input_option=ValueInputOption.user_entered)
 
-                        cell = inv_ws.find(str(c["item_id"]), in_column=1)
-                        if cell:
-                            current = int(inv_ws.cell(cell.row, 6).value or 0)
-                            inv_ws.update_cell(cell.row, 6,
-                                               current - c["qty"])
+                    # Batch stock updates
+                    inv_records = get_inventory()
+                    updates = []
+                    for c in st.session_state.cart:
+                        for idx, inv_item in enumerate(inv_records):
+                            if str(inv_item.get("id")) == str(c["item_id"]):
+                                new_stock = int(inv_item.get("stock", 0) or 0) - c["qty"]
+                                updates.append({"range": f"F{idx + 2}",
+                                    "values": [[new_stock]]})
+                                break
+                    if updates:
+                        inv_ws.batch_update(updates,
+                            value_input_option=ValueInputOption.user_entered)
 
                     if combo_log_ws and applied_deals:
                         combo_records = combo_log_ws.get_all_records()
                         next_log_id = next_id(combo_records)
+                        combo_rows = []
                         for d in applied_deals:
-                            combo_log_ws.append_row([
-                                next_log_id, sale_id,
+                            combo_rows.append([next_log_id, sale_id,
                                 d["deal_id"], d["deal_name"],
-                                d["items_qty"],
-                                round(d["discount_amount"], 2)
-                            ])
+                                d["items_qty"], round(d["discount_amount"], 2)])
                             next_log_id += 1
+                        combo_log_ws.append_rows(combo_rows,
+                            value_input_option=ValueInputOption.user_entered)
 
                     clear_cache()
-                    st.success(f"Sale #{sale_id} recorded — "
-                               f"${final_total:.2f} 🎉")
-                    st.session_state.cart = []
-                    st.rerun()
+                    st.success(f"Sale #{sale_id} — ${final_total:.2f} 🎉")
+                    st.session_state.cart = []; st.rerun()
 
-                if b2.button("🗑 Clear Cart", use_container_width=True):
-                    st.session_state.cart = []
-                    st.rerun()
+                if b2.button("🗑 Clear", width="stretch"):
+                    st.session_state.cart = []; st.rerun()
+
 # ================================================================
 # 📦 INVENTORY
 # ================================================================
 elif page == "📦 Inventory":
     st.title("📦 Inventory")
     tab1, tab2 = st.tabs(["View", "➕ Add New"])
-
     with tab1:
         items = get_inventory()
         if items:
-            df = pd.DataFrame(items)
-            st.dataframe(df, use_container_width=True, hide_index=True)
-            st.caption("💡 Edit directly in your Google Sheet — "
-                       "changes appear within 10 sec (or hit Refresh).")
+            st.dataframe(pd.DataFrame(items), width="stretch", hide_index=True)
+            st.caption("💡 Edit in Google Sheet — cached 10 min (refresh with sidebar button)")
         else:
             st.info("No items yet.")
-
     with tab2:
         with st.form("add_item", clear_on_submit=True):
             name = st.text_input("Name *")
             c1, c2 = st.columns(2)
-            category = c1.text_input("Category",
-                placeholder="Charm, Sticker, Print...")
-            series = c2.text_input("Series / Fandom",
-                placeholder="Genshin Impact, Original, etc.")
+            category = c1.text_input("Category", placeholder="Charm, Sticker...")
+            series = c2.text_input("Series", placeholder="Genshin Impact, Original...")
             c3, c4, c5 = st.columns(3)
             price = c3.number_input("Price ($)", min_value=0.0, step=0.50)
             cost = c4.number_input("Cost ($)", min_value=0.0, step=0.10)
             stock = c5.number_input("Stock", min_value=0, step=1)
+            image_url = st.text_input("Image URL (optional)")
             if st.form_submit_button("➕ Add", type="primary"):
                 if not name.strip():
                     st.error("Name required.")
                 else:
                     new_id = next_id(get_inventory())
-                    inv_ws.append_row([
-                        new_id, name.strip(), category.strip(),
-                        price, cost, int(stock), series.strip()
-                    ])
+                    inv_ws.append_row([new_id, name.strip(), category.strip(),
+                        price, cost, int(stock), series.strip(), image_url.strip()],
+                        value_input_option=ValueInputOption.user_entered)
                     clear_cache()
                     st.success(f"Added {name}!")
 
@@ -859,246 +749,150 @@ elif page == "📦 Inventory":
 # ================================================================
 elif page == "🎁 Combo Deals":
     st.title("🎁 Combo Deals")
-    st.caption("Configure automatic bundle pricing. "
-               "Deals auto-apply at checkout.")
-
-    tab1, tab2, tab3 = st.tabs(
-        ["Active Deals", "➕ Add Deal", "📈 Deal Performance"])
-
+    tab1, tab2, tab3 = st.tabs(["Active", "➕ Add", "📈 Performance"])
     with tab1:
         deals = get_deals() if deals_ws else []
-        if deals:
-            df = pd.DataFrame(deals)
-            st.dataframe(df, use_container_width=True, hide_index=True)
-            st.caption("💡 Edit or deactivate deals directly in the "
-                       "'Combo Deals' tab of your Google Sheet.")
-        else:
-            st.info("No active deals. Add one in the next tab!")
-
+        if deals: st.dataframe(pd.DataFrame(deals), width="stretch", hide_index=True)
+        else: st.info("No active deals.")
     with tab2:
         if not deals_ws:
-            st.error("Add a 'Combo Deals' tab to your Google Sheet first.")
+            st.error("Add a 'Combo Deals' tab first.")
         else:
             with st.form("add_deal", clear_on_submit=True):
-                name = st.text_input("Deal name *",
-                    placeholder="e.g. 3 Charms for $20")
-                dtype = st.selectbox("Deal type", [
-                    "qty_same", "mix_category",
-                    "bundle", "bogo", "cart_percent"],
-                    help="qty_same = X of same item for $Y • "
-                         "mix_category = X of any in category for $Y • "
-                         "bundle = specific items for $Y • "
-                         "bogo = buy X get cheapest free • "
-                         "cart_percent = % off orders over $X")
+                name = st.text_input("Deal name *")
+                dtype = st.selectbox("Type",
+                    ["qty_same", "mix_category", "bundle", "bogo", "cart_percent"])
                 c1, c2 = st.columns(2)
-                trigger_qty = c1.number_input(
-                    "Trigger quantity", min_value=0, step=1)
-                combo_price = c2.number_input(
-                    "Combo price ($)", min_value=0.0, step=0.50,
-                    help="For cart_percent, this is the threshold amount")
+                tqty = c1.number_input("Trigger qty", min_value=0, step=1)
+                cprice = c2.number_input("Combo price ($)", min_value=0.0, step=0.50)
                 c3, c4 = st.columns(2)
-                trigger_cat = c3.text_input(
-                    "Category (if applicable)",
-                    placeholder="Sticker, Charm, Print...")
-                discount_pct = c4.number_input(
-                    "Discount % (BOGO/cart_percent)",
-                    min_value=0.0, max_value=100.0, step=1.0)
-                trigger_items = st.text_input(
-                    "Item IDs for bundles (comma-separated)",
-                    placeholder="e.g. 5,12")
-
-                if st.form_submit_button("➕ Add Deal", type="primary"):
+                tcat = c3.text_input("Category")
+                dpct = c4.number_input("Discount %", min_value=0.0, max_value=100.0)
+                titems = st.text_input("Item IDs (bundle)")
+                if st.form_submit_button("➕ Add", type="primary"):
                     if not name.strip():
-                        st.error("Deal name required.")
+                        st.error("Name required.")
                     else:
                         new_id = next_id(deals_ws.get_all_records())
-                        deals_ws.append_row([
-                            new_id, name.strip(), dtype,
-                            int(trigger_qty), trigger_cat.strip(),
-                            trigger_items.strip(), combo_price,
-                            discount_pct, "TRUE"
-                        ])
+                        deals_ws.append_row([new_id, name.strip(), dtype,
+                            int(tqty), tcat.strip(), titems.strip(),
+                            cprice, dpct, "TRUE"],
+                            value_input_option=ValueInputOption.user_entered)
                         clear_cache()
                         st.success(f"Added '{name}'!")
-
     with tab3:
         if combo_log_ws:
             logs = combo_log_ws.get_all_records()
             if logs:
                 df = pd.DataFrame(logs)
-                df["discount_amount"] = pd.to_numeric(
-                    df["discount_amount"], errors="coerce").fillna(0)
-
+                df["discount_amount"] = pd.to_numeric(df["discount_amount"],
+                    errors="coerce").fillna(0)
                 perf = df.groupby("deal_name").agg(
                     times_used=("id", "count"),
-                    total_discount=("discount_amount", "sum"),
-                    items_moved=("items_qty", "sum")
-                ).sort_values("times_used", ascending=False)
-
-                st.subheader("Which deals are working?")
-                st.dataframe(perf.style.format({
-                    "total_discount": "${:.2f}"
-                }), use_container_width=True)
-
+                    total_discount=("discount_amount", "sum")).sort_values(
+                    "times_used", ascending=False)
+                st.dataframe(perf, width="stretch")
                 st.bar_chart(perf["times_used"])
-                st.caption(
-                    f"Total discounts given: "
-                    f"**${df['discount_amount'].sum():.2f}** "
-                    f"across **{len(df)}** applied deals")
             else:
-                st.info("No combo deals used yet. "
-                        "They'll show up here after your first combo sale!")
-        else:
-            st.info("Add a 'Combo Sales Log' tab to your Google Sheet "
-                    "to enable performance tracking.")
+                st.info("No combo sales yet.")
+
 # ================================================================
 # 🎯 GOALS
 # ================================================================
 elif page == "🎯 Goals":
     st.title("🎯 Sales Goals")
-
-    tab1, tab2, tab3 = st.tabs(
-        ["Current Event", "All Goals", "📈 Goal History"])
-
+    tab1, tab2, tab3 = st.tabs(["Current Event", "All Goals", "📈 History"])
     with tab1:
         if not st.session_state.current_event:
-            st.info("👈 Set a Current Event in the sidebar to track live goal progress.")
+            st.info("👈 Set a Current Event in sidebar first.")
         else:
             render_goal_progress(st.session_state.current_event, compact=False)
-
-            # Pace calculator
             goal = get_goal_for_event(st.session_state.current_event)
             if goal["revenue_goal"] > 0:
                 current = event_revenue(st.session_state.current_event)
+                total_costs = (goal["table_cost"] + goal["hotel_cost"]
+                              + goal["travel_cost"] + goal["other_costs"])
                 st.markdown("---")
                 st.subheader("⏱ Pace Calculator")
-
                 pc1, pc2 = st.columns(2)
-                hours_worked = pc1.number_input(
-                    "Hours worked so far today",
-                    min_value=0.5, value=4.0, step=0.5)
-                hours_remaining = pc2.number_input(
-                    "Hours remaining in event",
-                    min_value=0.0, value=6.0, step=0.5)
-
-                if hours_worked > 0:
-                    rate = current / hours_worked
-                    projected = current + (rate * hours_remaining)
-                    projected_pct = (projected / goal["revenue_goal"]) * 100
+                hw = pc1.number_input("Hours worked so far", min_value=0.5, value=4.0, step=0.5)
+                hr = pc2.number_input("Hours remaining", min_value=0.0, value=6.0, step=0.5)
+                if hw > 0:
+                    rate = current / hw
+                    projected = current + (rate * hr)
                     projected_profit = projected - total_costs
-
-                    pcm1, pcm2, pcm3, pcm4 = st.columns(4)
-                    pcm1.metric("Rate", f"${rate:.2f}/hr")
-                    pcm2.metric("Projected revenue", f"${projected:.2f}")
-                    pcm3.metric("Projected profit",
-                                f"${projected_profit:.2f}",
-                                delta_color="normal" if projected_profit >= 0
-                                            else "inverse")
-                    pcm4.metric("Projected % of goal",
-                                f"{projected_pct:.0f}%")
-
-                    # Contextual advice
-                    remaining_needed = goal["revenue_goal"] - current
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Rate", f"${rate:.2f}/hr")
+                    m2.metric("Projected revenue", f"${projected:.2f}")
+                    m3.metric("Projected profit", f"${projected_profit:.2f}",
+                        delta_color="normal" if projected_profit >= 0 else "inverse")
                     breakeven_needed = total_costs - current
-                    if breakeven_needed > 0 and hours_remaining > 0:
-                        breakeven_rate = breakeven_needed / hours_remaining
-                        st.warning(
-                            f"⚠️ Still ${breakeven_needed:.0f} away from breaking "
-                            f"even. Need ${breakeven_rate:.2f}/hr just to cover costs.")
-                    if remaining_needed > 0 and hours_remaining > 0:
-                        needed_rate = remaining_needed / hours_remaining
-                        if needed_rate > rate:
-                            st.warning(
-                                f"💪 Need to pick up the pace: "
-                                f"${needed_rate:.2f}/hr to hit goal "
-                                f"(currently ${rate:.2f}/hr)")
+                    if breakeven_needed > 0 and hr > 0:
+                        st.warning(f"⚠️ Still ${breakeven_needed:.0f} to break even. "
+                                   f"Need ${breakeven_needed/hr:.2f}/hr just to cover costs.")
+                    remaining = goal["revenue_goal"] - current
+                    if remaining > 0 and hr > 0:
+                        need = remaining / hr
+                        if need > rate:
+                            st.warning(f"💪 Need ${need:.2f}/hr to hit goal.")
                         else:
-                            st.success(
-                                f"✅ On track! Just need ${needed_rate:.2f}/hr "
-                                f"the rest of the way.")
+                            st.success(f"✅ On track! Just need ${need:.2f}/hr.")
+
     with tab2:
         goals = get_goals()
         if not goals:
-            st.info("Add goals to your 'Goals' tab in the Google Sheet.")
+            st.info("Add goals to 'Goals' tab.")
         else:
-            df_goals = pd.DataFrame(goals)
-            st.dataframe(df_goals, use_container_width=True, hide_index=True)
-            st.caption("💡 Edit goals directly in the Google Sheet — "
-                       "changes appear within 30 sec.")
+            st.dataframe(pd.DataFrame(goals), width="stretch", hide_index=True)
 
     with tab3:
         goals = get_goals()
         sales = get_sales()
         if not goals or not sales:
-            st.info("Need goals + at least one completed event to see history.")
+            st.info("Need goals + sales data.")
         else:
             df_sales = pd.DataFrame(sales)
-            df_sales["total"] = pd.to_numeric(
-                df_sales["total"], errors="coerce").fillna(0)
-            df_sales["event"] = df_sales["event"].fillna("").astype(str)
-
+            df_sales["total"] = pd.to_numeric(df_sales["total"], errors="coerce").fillna(0)
+            df_sales["event"] = df_sales.get("event", "").astype(str)
             history = []
             for g in goals:
                 event = str(g.get("event", "")).strip()
                 if event == "_default_" or not event: continue
                 gval = float(g.get("revenue_goal", 0) or 0)
                 if gval <= 0: continue
-
-                table = float(g.get("table_cost", 0) or 0)
-                hotel = float(g.get("hotel_cost", 0) or 0)
-                travel = float(g.get("travel_cost", 0) or 0)
-                other = float(g.get("other_costs", 0) or 0)
-                total_cost = table + hotel + travel + other
-
+                tcost = (float(g.get("table_cost", 0) or 0)
+                        + float(g.get("hotel_cost", 0) or 0)
+                        + float(g.get("travel_cost", 0) or 0)
+                        + float(g.get("other_costs", 0) or 0))
                 actual = df_sales[df_sales["event"] == event]["total"].sum()
-                pct = (actual / gval * 100) if gval else 0
-                profit = actual - total_cost
-                margin = (profit / actual * 100) if actual > 0 else 0
-
-                history.append({
-                    "Event": event,
-                    "Revenue": actual,
-                    "Goal": gval,
-                    "Total Cost": total_cost,
-                    "Net Profit": profit,
-                    "Margin": margin,
+                pct = (actual/gval*100) if gval else 0
+                profit = actual - tcost
+                margin = (profit/actual*100) if actual > 0 else 0
+                history.append({"Event": event, "Revenue": actual, "Goal": gval,
+                    "Total Cost": tcost, "Net Profit": profit, "Margin": margin,
                     "% of Goal": pct,
-                    "Result": "🎉 Hit" if pct >= 100 else
-                              ("👍 Close" if pct >= 80 else "📉 Missed"),
-                    "Profitable": "✅" if profit > 0 else "❌",
-                })
-
-            if not history:
-                st.info("No completed events with revenue yet.")
-            else:
-                df_hist = pd.DataFrame(history).sort_values(
-                    "Net Profit", ascending=False)
-
-                hit_count = sum(1 for h in history if h["% of Goal"] >= 100)
-                profitable_count = sum(1 for h in history if h["Net Profit"] > 0)
-                total = len(history)
-                total_profit = sum(h["Net Profit"] for h in history)
-
-                mh1, mh2, mh3, mh4 = st.columns(4)
-                mh1.metric("Events", total)
-                mh2.metric("Goals hit",
-                          f"{hit_count} ({hit_count/total*100:.0f}%)")
-                mh3.metric("Profitable",
-                          f"{profitable_count} ({profitable_count/total*100:.0f}%)")
-                mh4.metric("Total profit", f"${total_profit:.2f}")
-
-                display = df_hist.copy()
-                display["Revenue"] = display["Revenue"].map("${:.0f}".format)
-                display["Goal"] = display["Goal"].map("${:.0f}".format)
-                display["Total Cost"] = display["Total Cost"].map("${:.0f}".format)
-                display["Net Profit"] = display["Net Profit"].map("${:+.0f}".format)
-                display["Margin"] = display["Margin"].map("{:.0f}%".format)
-                display["% of Goal"] = display["% of Goal"].map("{:.0f}%".format)
-                st.dataframe(display, use_container_width=True, hide_index=True)
-
-                # Profit-focused chart
+                    "Result": "🎉 Hit" if pct>=100 else ("👍 Close" if pct>=80 else "📉 Missed"),
+                    "Profitable": "✅" if profit > 0 else "❌"})
+            if history:
+                df_hist = pd.DataFrame(history).sort_values("Net Profit", ascending=False)
+                hit = sum(1 for h in history if h["% of Goal"] >= 100)
+                prof = sum(1 for h in history if h["Net Profit"] > 0)
+                total_p = sum(h["Net Profit"] for h in history)
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Events", len(history))
+                m2.metric("Goals hit", f"{hit} ({hit/len(history)*100:.0f}%)")
+                m3.metric("Profitable", f"{prof} ({prof/len(history)*100:.0f}%)")
+                m4.metric("Total profit", f"${total_p:.2f}")
+                disp = df_hist.copy()
+                for col in ["Revenue", "Goal", "Total Cost"]:
+                    disp[col] = disp[col].map("${:.0f}".format)
+                disp["Net Profit"] = disp["Net Profit"].map("${:+.0f}".format)
+                disp["Margin"] = disp["Margin"].map("{:.0f}%".format)
+                disp["% of Goal"] = disp["% of Goal"].map("{:.0f}%".format)
+                st.dataframe(disp, width="stretch", hide_index=True)
                 st.subheader("💰 Net Profit by Convention")
                 st.bar_chart(df_hist.set_index("Event")["Net Profit"])
+
 # ================================================================
 # 📜 SALES HISTORY
 # ================================================================
@@ -1110,172 +904,78 @@ elif page == "📜 Sales History":
     else:
         df = pd.DataFrame(sales)
         events = sorted(set(str(e) for e in df.get("event", []) if e))
-        event_filter = st.selectbox("Filter by event",
-            ["All events"] + events)
-        if event_filter != "All events":
-            df = df[df["event"] == event_filter]
+        ef = st.selectbox("Filter by event", ["All"] + events)
+        if ef != "All": df = df[df["event"] == ef]
         df = df.sort_values("sold_at", ascending=False)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        total_shown = pd.to_numeric(df["total"], errors="coerce").sum()
-        st.caption(f"Showing {len(df)} sales • "
-                   f"Total: **${total_shown:.2f}**")
+        st.dataframe(df, width="stretch", hide_index=True)
+        total = pd.to_numeric(df["total"], errors="coerce").sum()
+        st.caption(f"Showing {len(df)} sales • Total: **${total:.2f}**")
 
 # ================================================================
 # 📊 DASHBOARD
 # ================================================================
 elif page == "📊 Dashboard":
     st.title("📊 Dashboard")
-    # 🎯 Current event goal snapshot
     if st.session_state.current_event:
         goal = get_goal_for_event(st.session_state.current_event)
         if goal["revenue_goal"] > 0:
             render_goal_progress(st.session_state.current_event, compact=True)
             st.markdown("---")
+
     sales = get_sales()
     sale_items = get_sale_items()
-
     if not sales:
         st.info("No sales data yet.")
     else:
         df_sales = pd.DataFrame(sales)
-        df_sales["total"] = pd.to_numeric(
-            df_sales["total"], errors="coerce").fillna(0)
-        df_sales["sold_at"] = pd.to_datetime(
-            df_sales["sold_at"], errors="coerce")
-        df_sales["event"] = df_sales["event"].fillna(
-            "(no event)").replace("", "(no event)")
+        df_sales["total"] = pd.to_numeric(df_sales["total"], errors="coerce").fillna(0)
+        df_sales["sold_at"] = pd.to_datetime(df_sales["sold_at"], errors="coerce")
+        df_sales["event"] = df_sales["event"].fillna("(no event)").replace("", "(no event)")
 
         today = pd.Timestamp(date.today())
         week_ago = today - pd.Timedelta(days=7)
-
-        rev_today = df_sales[df_sales["sold_at"] >= today]["total"].sum()
-        rev_week = df_sales[df_sales["sold_at"] >= week_ago]["total"].sum()
-        rev_all = df_sales["total"].sum()
+        rev_t = df_sales[df_sales["sold_at"] >= today]["total"].sum()
+        rev_w = df_sales[df_sales["sold_at"] >= week_ago]["total"].sum()
+        rev_a = df_sales["total"].sum()
 
         df_items = pd.DataFrame(sale_items) if sale_items else pd.DataFrame()
         profit = 0
         if not df_items.empty:
-            df_items["unit_price"] = pd.to_numeric(
-                df_items["unit_price"], errors="coerce").fillna(0)
-            df_items["unit_cost"] = pd.to_numeric(
-                df_items["unit_cost"], errors="coerce").fillna(0)
-            df_items["qty"] = pd.to_numeric(
-                df_items["qty"], errors="coerce").fillna(0)
-            profit = ((df_items["unit_price"] - df_items["unit_cost"])
-                      * df_items["qty"]).sum()
+            for col in ["unit_price", "unit_cost", "qty"]:
+                df_items[col] = pd.to_numeric(df_items[col], errors="coerce").fillna(0)
+            profit = ((df_items["unit_price"] - df_items["unit_cost"]) * df_items["qty"]).sum()
 
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Today", f"${rev_today:.2f}")
-        m2.metric("Last 7 days", f"${rev_week:.2f}")
-        m3.metric("All-time", f"${rev_all:.2f}")
-        m4.metric("Est. profit", f"${profit:.2f}")
+        m1.metric("Today", f"${rev_t:.2f}")
+        m2.metric("7 days", f"${rev_w:.2f}")
+        m3.metric("All-time", f"${rev_a:.2f}")
+        m4.metric("Profit", f"${profit:.2f}")
 
-        # ============ REVENUE BY CONVENTION ============
         st.markdown("---")
         st.subheader("🏪 Revenue by Convention")
-
         by_event = df_sales.groupby("event").agg(
             revenue=("total", "sum"),
-            sales_count=("id", "count")
-        ).sort_values("revenue", ascending=False)
+            sales_count=("id", "count")).sort_values("revenue", ascending=False)
+        st.bar_chart(by_event["revenue"])
+        st.dataframe(by_event, width="stretch")
 
         if not df_items.empty:
-            df_items["profit_line"] = (
-                (df_items["unit_price"] - df_items["unit_cost"])
-                * df_items["qty"])
-            sale_to_event = dict(zip(
-                df_sales["id"].astype(str), df_sales["event"]))
-            df_items["event"] = (df_items["sale_id"].astype(str)
-                                  .map(sale_to_event).fillna("(no event)"))
-            event_profit = df_items.groupby("event")["profit_line"].sum()
-            by_event["est_profit"] = (by_event.index
-                                       .map(event_profit).fillna(0))
-
-        by_event["avg_sale"] = by_event["revenue"] / by_event["sales_count"]
-
-        ec1, ec2 = st.columns([1, 1])
-        with ec1:
-            st.bar_chart(by_event["revenue"])
-        with ec2:
-            display_df = by_event.copy()
-            display_df["revenue"] = display_df["revenue"].map("${:.2f}".format)
-            display_df["avg_sale"] = display_df["avg_sale"].map("${:.2f}".format)
-            if "est_profit" in display_df.columns:
-                display_df["est_profit"] = display_df["est_profit"].map(
-                    "${:.2f}".format)
-            st.dataframe(display_df, use_container_width=True)
-
-        # Deep dive
-        st.markdown("**🔍 Deep dive into one event:**")
-        selected = st.selectbox("Pick an event",
-            options=list(by_event.index))
-        if selected:
-            event_sales = df_sales[df_sales["event"] == selected]
-            ec1, ec2, ec3 = st.columns(3)
-            ec1.metric("Total revenue",
-                       f"${event_sales['total'].sum():.2f}")
-            ec2.metric("Number of sales", len(event_sales))
-            ec3.metric("Avg sale value",
-                       f"${event_sales['total'].mean():.2f}")
-
-            pay_breakdown = event_sales.groupby("payment")["total"].sum()
-            st.write("**By payment method:**")
-            st.bar_chart(pay_breakdown)
-
-            if not df_items.empty:
-                event_items = df_items[df_items["event"] == selected]
-                top_items = (event_items.groupby("item_name")["qty"]
-                             .sum().sort_values(ascending=False).head(10))
-                if not top_items.empty:
-                    st.write("**Top items at this event:**")
-                    st.bar_chart(top_items)
-# ============ REVENUE BY SERIES ============
-        if not df_items.empty:
-            st.markdown("---")
-            st.subheader("🎌 Revenue by Series")
-
-            # Pull series info from inventory
-            inv_data = get_inventory()
-            item_series = {}
-            for it in inv_data:
-                item_series[str(it["id"])] = str(it.get("series", "") or "").strip() or "Other"
-
-            df_items["series"] = df_items["item_id"].astype(str).map(item_series).fillna("Other")
-            df_items["revenue_line"] = df_items["unit_price"] * df_items["qty"]
-
-            series_stats = df_items.groupby("series").agg(
-                revenue=("revenue_line", "sum"),
-                qty_sold=("qty", "sum"),
-                unique_items=("item_id", "nunique")
-            ).sort_values("revenue", ascending=False)
-
-            sc1, sc2 = st.columns([1, 1])
-            with sc1:
-                st.bar_chart(series_stats["revenue"])
-            with sc2:
-                display = series_stats.copy()
-                display["revenue"] = display["revenue"].map("${:.2f}".format)
-                st.dataframe(display, use_container_width=True)
-
-            st.caption("💡 See which fandoms are worth making more art for!")
-        # ============ TOP SELLERS OVERALL ============
-        st.markdown("---")
-        if not df_items.empty:
-            st.subheader("🏆 Top Sellers (All Events)")
-            top = (df_items.groupby("item_name")["qty"].sum()
-                   .sort_values(ascending=False).head(10))
+            st.subheader("🏆 Top Sellers")
+            top = df_items.groupby("item_name")["qty"].sum().sort_values(
+                ascending=False).head(10)
             st.bar_chart(top)
 
-        # ============ DAILY REVENUE ============
         st.subheader("📅 Daily Revenue")
         daily = df_sales.groupby(df_sales["sold_at"].dt.date)["total"].sum()
         st.line_chart(daily)
 
-    # Low stock alert
     inv = get_inventory()
     if inv:
-        low = [i for i in inv if int(i.get("stock", 0) or 0) <= 3]
-        if low:
-            st.subheader("⚠️ Low Stock")
-            st.dataframe(pd.DataFrame(low)[["name", "stock"]],
-                         hide_index=True)
+        df_inv = pd.DataFrame(inv)
+        df_inv.columns = [str(c).strip().lower() for c in df_inv.columns]
+        if "stock" in df_inv.columns and "name" in df_inv.columns:
+            df_inv["stock"] = pd.to_numeric(df_inv["stock"], errors="coerce").fillna(0)
+            low = df_inv[df_inv["stock"] <= 3]
+            if not low.empty:
+                st.subheader("⚠️ Low Stock")
+                st.dataframe(low[["name", "stock"]], hide_index=True, width="stretch")
