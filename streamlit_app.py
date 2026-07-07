@@ -349,40 +349,106 @@ if page == "💵 Quick Sale":
     if st.session_state.current_event:
         st.caption(f"📍 Current event: **{st.session_state.current_event}**")
 
-    items = [i for i in get_inventory() if int(i.get("stock", 0) or 0) > 0]
+    all_items = [i for i in get_inventory() if int(i.get("stock", 0) or 0) > 0]
 
-    if not items:
+    if not all_items:
         st.info("Add items in the Inventory tab first!")
     else:
-        col1, col2 = st.columns([1.2, 1])
+        # Normalize category values
+        for it in all_items:
+            it["category"] = str(it.get("category", "") or "").strip() or "Uncategorized"
+
+        # Get unique categories, sorted with item counts
+        cat_counts = {}
+        for it in all_items:
+            cat_counts[it["category"]] = cat_counts.get(it["category"], 0) + 1
+        categories = sorted(cat_counts.keys())
+
+        # Get top sellers for the ⭐ shortcut view
+        try:
+            sale_items_data = get_sale_items()
+            if sale_items_data:
+                df_si = pd.DataFrame(sale_items_data)
+                df_si["qty"] = pd.to_numeric(df_si["qty"], errors="coerce").fillna(0)
+                top_ids = (df_si.groupby("item_id")["qty"].sum()
+                           .sort_values(ascending=False).head(12).index.tolist())
+                top_ids = [str(t) for t in top_ids]
+            else:
+                top_ids = []
+        except Exception:
+            top_ids = []
+
+        col1, col2 = st.columns([1.4, 1])
 
         with col1:
-            st.subheader("Tap to add")
-            cols = st.columns(2)
-            for i, it in enumerate(items):
-                with cols[i % 2]:
-                    label = (f"**{it['name']}**\n"
-                             f"${float(it['price']):.2f} • stock: {it['stock']}")
-                    if st.button(label, key=f"add_{it['id']}",
-                                 use_container_width=True):
-                        found = False
-                        for c in st.session_state.cart:
-                            if c["item_id"] == it["id"]:
-                                if c["qty"] + 1 > int(it["stock"]):
-                                    st.warning("Not enough stock.")
-                                else:
-                                    c["qty"] += 1
-                                found = True
-                                break
-                        if not found:
-                            st.session_state.cart.append({
-                                "item_id": it["id"],
-                                "name": it["name"],
-                                "qty": 1,
-                                "price": float(it["price"]),
-                                "cost": float(it.get("cost", 0) or 0)
-                            })
-                        st.rerun()
+            # ---------- Filter bar ----------
+            filter_options = ["🛍 All Items"]
+            if top_ids:
+                filter_options.append("⭐ Top Sellers")
+            filter_options += [f"{c} ({cat_counts[c]})" for c in categories]
+
+            selected_filter = st.radio(
+                "Category", filter_options,
+                horizontal=True, label_visibility="collapsed")
+
+            # Live search
+            search = st.text_input(
+                "🔍 Search", "",
+                placeholder="Type a name to filter...",
+                label_visibility="collapsed")
+
+            # Apply filters
+            if selected_filter == "🛍 All Items":
+                items = all_items
+            elif selected_filter == "⭐ Top Sellers":
+                items = [i for i in all_items if str(i["id"]) in top_ids]
+                # Preserve top-seller order
+                items.sort(key=lambda x: top_ids.index(str(x["id"]))
+                           if str(x["id"]) in top_ids else 999)
+            else:
+                # Strip the "(count)" suffix
+                cat_name = selected_filter.rsplit(" (", 1)[0]
+                items = [i for i in all_items if i["category"] == cat_name]
+
+            if search.strip():
+                s = search.strip().lower()
+                items = [i for i in items if s in str(i["name"]).lower()]
+
+            st.caption(f"Showing **{len(items)}** item(s)")
+
+            # ---------- Item grid ----------
+            if not items:
+                st.info("No items match your filter/search.")
+            else:
+                # 3-column compact grid
+                cols = st.columns(3)
+                for i, it in enumerate(items):
+                    with cols[i % 3]:
+                        low = int(it["stock"]) <= 3
+                        stock_badge = f"⚠️ {it['stock']}" if low else f"stock: {it['stock']}"
+                        label = (f"**{it['name']}**\n"
+                                 f"${float(it['price']):.2f}\n"
+                                 f"{stock_badge}")
+                        if st.button(label, key=f"add_{it['id']}",
+                                     use_container_width=True):
+                            found = False
+                            for c in st.session_state.cart:
+                                if c["item_id"] == it["id"]:
+                                    if c["qty"] + 1 > int(it["stock"]):
+                                        st.warning("Not enough stock.")
+                                    else:
+                                        c["qty"] += 1
+                                    found = True
+                                    break
+                            if not found:
+                                st.session_state.cart.append({
+                                    "item_id": it["id"],
+                                    "name": it["name"],
+                                    "qty": 1,
+                                    "price": float(it["price"]),
+                                    "cost": float(it.get("cost", 0) or 0)
+                                })
+                            st.rerun()
 
         with col2:
             st.subheader("🛒 Cart")
@@ -406,7 +472,7 @@ if page == "💵 Quick Sale":
                         st.session_state.cart.pop(idx)
                         st.rerun()
 
-                # ---------- Combo deal calculation ----------
+                # Combo calculation
                 inventory = get_inventory()
                 deals = get_deals()
                 final_total, applied_deals, _ = calculate_combos(
@@ -426,7 +492,6 @@ if page == "💵 Quick Sale":
 
                 st.markdown(f"### Total: **${final_total:.2f}**")
 
-                # Manual override
                 override = st.checkbox("Manually adjust total")
                 if override:
                     final_total = st.number_input(
@@ -467,7 +532,6 @@ if page == "💵 Quick Sale":
                             inv_ws.update_cell(cell.row, 6,
                                                current - c["qty"])
 
-                    # Log applied combos
                     if combo_log_ws and applied_deals:
                         combo_records = combo_log_ws.get_all_records()
                         next_log_id = next_id(combo_records)
@@ -489,7 +553,6 @@ if page == "💵 Quick Sale":
                 if b2.button("🗑 Clear Cart", use_container_width=True):
                     st.session_state.cart = []
                     st.rerun()
-
 # ================================================================
 # 📦 INVENTORY
 # ================================================================
