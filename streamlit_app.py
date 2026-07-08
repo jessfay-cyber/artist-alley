@@ -938,12 +938,22 @@ elif page == "📊 Dashboard":
         rev_w = df_sales[df_sales["sold_at"] >= week_ago]["total"].sum()
         rev_a = df_sales["total"].sum()
 
-        df_items = pd.DataFrame(sale_items) if sale_items else pd.DataFrame()
+       df_items = pd.DataFrame(sale_items) if sale_items else pd.DataFrame()
 profit = 0
 if not df_items.empty:
-    for col in ["unit_price", "unit_cost", "qty"]:
-        df_items[col] = pd.to_numeric(df_items[col], errors="coerce").fillna(0)
-    profit = ((df_items["unit_price"] - df_items["unit_cost"]) * df_items["qty"]).sum()
+    # Normalize column names (handles capitalization/spaces)
+    df_items.columns = [str(c).strip().lower() for c in df_items.columns]
+
+    # Only proceed if required columns exist
+    required = {"unit_price", "unit_cost", "qty"}
+    if required.issubset(set(df_items.columns)):
+        for col in required:
+            df_items[col] = pd.to_numeric(df_items[col], errors="coerce").fillna(0)
+        profit = ((df_items["unit_price"] - df_items["unit_cost"]) * df_items["qty"]).sum()
+    else:
+        missing = required - set(df_items.columns)
+        st.warning(f"⚠️ Sale Items tab is missing columns: {', '.join(missing)}. "
+                   f"Profit calculation skipped until fixed.")
 
      m1, m2, m3, m4 = st.columns(4)
         m1.metric("Today", f"${rev_t:.2f}")
